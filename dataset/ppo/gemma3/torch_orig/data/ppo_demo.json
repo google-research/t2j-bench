@@ -1,0 +1,22 @@
+[
+  {"instruction": "Explain the concept of photosynthesis in simple terms.", "input": "", "output": ""},
+  {"instruction": "What are the main differences between Python and JavaScript?", "input": "", "output": ""},
+  {"instruction": "Write a short poem about the ocean.", "input": "", "output": ""},
+  {"instruction": "How does a neural network learn?", "input": "", "output": ""},
+  {"instruction": "Describe the water cycle.", "input": "", "output": ""},
+  {"instruction": "What is the theory of relativity?", "input": "", "output": ""},
+  {"instruction": "Explain how a computer processor works.", "input": "", "output": ""},
+  {"instruction": "What are the benefits of regular exercise?", "input": "", "output": ""},
+  {"instruction": "How do vaccines work to protect against diseases?", "input": "", "output": ""},
+  {"instruction": "Describe the process of evolution by natural selection.", "input": "", "output": ""},
+  {"instruction": "What is quantum computing and why is it important?", "input": "", "output": ""},
+  {"instruction": "Explain the greenhouse effect.", "input": "", "output": ""},
+  {"instruction": "How does encryption protect data?", "input": "", "output": ""},
+  {"instruction": "What are the fundamental forces of nature?", "input": "", "output": ""},
+  {"instruction": "Describe how the internet works.", "input": "", "output": ""},
+  {"instruction": "What is machine learning and how does it differ from traditional programming?", "input": "", "output": ""},
+  {"instruction": "Explain the concept of supply and demand in economics.", "input": "", "output": ""},
+  {"instruction": "How do black holes form?", "input": "", "output": ""},
+  {"instruction": "What is the significance of DNA in biology?", "input": "", "output": ""},
+  {"instruction": "Describe the process of nuclear fusion in stars.", "input": "", "output": ""}
+]

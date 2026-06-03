@@ -1,0 +1,13 @@
+model_name_or_path: OpenGVLab/InternVL2-1B
+template: intern_vl
+output_dir: output
+do_train: true
+do_eval: false
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 5.0e-6
+num_train_epochs: 1
+bf16: true
+fp16: false
+pref_loss: sigmoid
+pref_beta: 0.1

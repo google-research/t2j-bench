@@ -1,0 +1,27 @@
+
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+# Host build tooling (packs the lf env into the Docker image).
+conda-pack
+
+# coding-agent runtime deps not pulled in by LlamaFactory/adk-python.
+jedi
+beautifulsoup4
+
+# Drives the staged equivalence evaluator.
+pytest
+
+# Required when an agent uses a Claude model (Vertex AI auth via the extra).
+anthropic[vertex]>=0.43.0
+
+# GPU compute, CUDA 12 builds.
+jax[cuda12]
+torch==2.12.0+cu126
+torchvision==0.27.0+cu126
+torchaudio==2.11.0+cu126
+
+# Pins that keep the env consistent after the CUDA torch install
+# (`pip check` should report no broken requirements afterward).
+pillow<12
+fsspec[http]<=2025.3.0
+pydantic-core==2.41.4

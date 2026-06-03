@@ -1,0 +1,35 @@
+### Model
+model_name_or_path: llava-hf/llava-v1.6-vicuna-7b-hf
+compute_dtype: bfloat16
+device_map: auto
+
+### Image processing
+image_max_pixels: 589824  # 768*768
+image_min_pixels: 1024    # 32*32
+
+### Data
+dataset: mllm_demo
+dataset_dir: data
+template: llava_next
+cutoff_len: 2048
+max_samples: 100
+
+### Training
+output_dir: output/llava_next_sft
+do_train: true
+num_train_epochs: 1.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-6
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+logging_steps: 5
+save_steps: 100
+bf16: true
+gradient_checkpointing: true
+
+### Finetuning
+finetuning_type: full
+freeze_vision_tower: true
+freeze_multi_modal_projector: true

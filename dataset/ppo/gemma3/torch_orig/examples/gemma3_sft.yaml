@@ -1,0 +1,35 @@
+### Model
+model_name_or_path: google/gemma-3-4b-it
+compute_dtype: bfloat16
+device_map: auto
+
+### Image processing
+image_max_pixels: 589824  # 768*768
+image_min_pixels: 1024    # 32*32
+
+### Data
+dataset: mllm_demo
+dataset_dir: data
+template: gemma3
+cutoff_len: 2048
+max_samples: 100
+
+### Training
+output_dir: output/gemma3_sft
+do_train: true
+num_train_epochs: 1.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-6
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+logging_steps: 5
+save_steps: 100
+bf16: true
+gradient_checkpointing: true
+
+### Finetuning
+finetuning_type: full
+freeze_vision_tower: true
+freeze_multi_modal_projector: true

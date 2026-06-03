@@ -1,0 +1,11 @@
+{
+  "ppo_demo": {
+    "file_name": "ppo_demo.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  }
+}

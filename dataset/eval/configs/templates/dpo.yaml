@@ -1,0 +1,22 @@
+training_method: dpo
+reference_impl: torch_orig
+candidate_impl: jax_repo
+precision_profile: bf16_compare
+runtime_profile: single_gpu
+output_dir: __AUTO_OUTPUT_DIR__
+batch_size: 1
+max_eval_examples: 1
+loss_trajectory_steps: 2
+generation_max_new_tokens: 16
+compare_hidden_states: false
+shared_config: {}
+implementations:
+  - name: torch_orig
+    framework: pytorch
+    repo_dir: __AUTO_REFERENCE_REPO__
+    device: cuda:0
+  - name: jax_repo
+    framework: flax
+    repo_dir: __AUTO_CANDIDATE_REPO__
+    device: cuda:0
+    backend_device: cuda:1
