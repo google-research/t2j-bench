@@ -53,8 +53,8 @@
   "name": "T2J-Bench Source Training Pipelines",
   "alternateName": "T2J-Bench",
   "description": "A benchmark dataset of 45 LLaMA-Factory-style PyTorch source training repositories for PyTorch-to-JAX repository migration. Each record is one end-to-end training pipeline for one model family and one training method: supervised fine-tuning (SFT), direct preference optimization (DPO), or proximal policy optimization (PPO). Each retained pipeline contains the source-side configuration parsing, tokenizer or processor construction, dataset loading, collation, model invocation, loss construction, optimizer interaction, and objective-specific artifacts required by the benchmark evaluator.",
-  "url": "https://anonymous.4open.science/r/t2j-bench-C308/",
-  "codeRepository": "https://anonymous.4open.science/r/t2j-bench-C308/",
+  "url": "https://github.com/google-research/t2j-bench",
+  "codeRepository": "https://github.com/google-research/t2j-bench",
   "version": "1.0.0",
   "datePublished": "2026-05-04",
   "dateModified": "2026-05-04",
@@ -62,13 +62,13 @@
   "creator": [
     {
       "@type": "sc:Organization",
-      "name": "Anonymous NeurIPS 2026 submission authors"
+      "name": "Google"
     }
   ],
   "publisher": [
     {
       "@type": "sc:Organization",
-      "name": "Anonymous NeurIPS 2026 submission authors"
+      "name": "Google"
     }
   ],
   "keywords": [
@@ -85,7 +85,7 @@
     "en"
   ],
   "isLiveDataset": false,
-  "citeAs": "Anonymous. T2J-Bench Source Training Pipelines: 45 PyTorch training repositories for benchmarking PyTorch-to-JAX migration. NeurIPS 2026 Evaluations and Datasets submission.",
+  "citeAs": "T2J-Bench Source Training Pipelines: 45 PyTorch training repositories for benchmarking PyTorch-to-JAX migration.",
   "conformsTo": [
     "http://mlcommons.org/croissant/1.1",
     "http://mlcommons.org/croissant/RAI/1.0"
