@@ -16,7 +16,7 @@ anthropic[vertex]>=0.43.0
 
 # GPU compute, CUDA 12 builds.
 jax[cuda12]
-torch==2.12.0+cu126
+torch==2.12.1+cu126
 torchvision==0.27.0+cu126
 torchaudio==2.11.0+cu126
 
