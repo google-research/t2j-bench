@@ -9,4 +9,4 @@ huggingface-hub==1.8.0
 pyyaml==6.0.3
 
 # Images for the multimodal tasks (e.g. core_qwen2_5_vl).
-pillow==11.3.0
+pillow==12.3.0

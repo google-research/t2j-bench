@@ -22,4 +22,4 @@ nvidia-ml-py==13.580.82
 pyyaml==6.0.3
 
 # Images for the multimodal tasks (e.g. core_qwen2_5_vl).
-pillow==11.3.0
+pillow==12.3.0
