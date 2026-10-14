@@ -1,0 +1,25 @@
+# Grade environment for the inference tasks (torch-free). Kept separate from grade.txt:
+# this class needs jax 0.11.0 / flax 0.12.8 (flax.nnx), while the training goldens are
+# frozen against jax 0.6.2 / flax 0.10.7.
+
+jax[cuda12]==0.11.0
+jaxlib==0.11.0
+numpy==2.2.6
+ml_dtypes==0.5.4
+pytest==9.1.0
+flax==0.12.8
+
+# The candidate reads the HF .safetensors checkpoint itself; the flax backend handles bf16.
+safetensors==0.7.0
+
+# Rust tokenizer for tokenizer.json; same pin as the torch side.
+tokenizers==0.22.2
+
+# NVML bindings for device/provenance checks and memory measurement helpers.
+nvidia-ml-py==13.580.82
+
+# Imported directly by the grader (instance.yaml checks).
+pyyaml==6.0.3
+
+# Images for the multimodal tasks (e.g. core_qwen2_5_vl).
+pillow==11.3.0

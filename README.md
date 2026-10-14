@@ -1,480 +1,310 @@
-# T2J-Bench
+<h1 align="center">T2J-BENCH</h1>
 
-T2J-Bench is a benchmark for semantic-preserving codebase conversion. It tests
-whether coding agents can convert LLaMA-Factory-style PyTorch training
-repositories into JAX/Flax repositories while preserving the training behavior
-that downstream users rely on.
+<p align="center">
+  <a href="https://arxiv.org/abs/2605.29054"><img src="https://img.shields.io/badge/Paper-arXiv-B31B1B?style=for-the-badge&logo=arxiv&logoColor=white" alt="Paper on arXiv"></a>
+  <a href="https://ft2023.github.io/T2j-web/"><img src="https://img.shields.io/badge/Website-T2J--Bench-009FDB?style=for-the-badge" alt="T2J-Bench website"></a>
+  <a href="https://huggingface.co/buckets/jiefengcgg/t2j-bench"><img src="https://img.shields.io/badge/Hugging_Face-T2J--Bench-FFD21E?style=for-the-badge&logo=huggingface&logoColor=FFD21E" alt="T2J-Bench artifacts on Hugging Face"></a>
+  <br>
+  <a href="#requirements"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10 or newer for host tools"></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/Docs-Quick_Start-009FDB?style=for-the-badge" alt="Quick start documentation"></a>
+  <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-Welcome-F97316?style=for-the-badge" alt="Pull requests welcome"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-2EA44F?style=for-the-badge" alt="Apache 2.0 license"></a>
+</p>
 
-The benchmark accompanies the paper
-[**"Converted, Not Equivalent": Benchmarking Codebase Conversion via
-Observational Equivalence**](https://arxiv.org/abs/2605.29054). Instead of only
-checking whether a converted repository runs, T2J-Bench evaluates each
-conversion against a fixed equivalence contract derived from the original
-PyTorch codebase.
+T2J-BENCH evaluates whether coding agents can migrate a PyTorch repository to native,
+torch-free JAX/Flax while preserving its numerical and end-to-end behavior. Each task
+provides source code and a raw checkpoint; the agent produces `jax_repo/`, and a separate,
+offline verifier compares it with frozen references from the PyTorch implementation.
 
-![T2J-Bench workflow](figs/teaser.png)
+The release contains **63 tasks**:
 
-## At a Glance
+| Task class | Instances | Naming | Target implementation |
+| --- | ---: | --- | --- |
+| Training | 45: 15 models × SFT, DPO, PPO | `{sft,dpo,ppo}_{model}` | `flax.linen` + `optax` |
+| Inference | 18: 6 families × 3 serving modes | `{core,ragged,chunked}_{family}` | JAX + `flax.nnx` |
 
-- **Task**: convert `torch_orig/` PyTorch training repos into candidate
-  `jax_repo/` implementations.
-- **Scale**: 45 datapoints = 15 model families x 3 training methods
-  (`SFT`, `DPO`, `PPO`).
-- **Model families**: `bloom`, `falcon`, `gemma3`, `internvl`, `llama3`,
-  `llava_next`, `mistral`, `paligemma`, `phi4`, `qwen2`, `qwen2_omni`,
-  `qwen2_vl`, `qwen3`, `qwen3_vl`, and `starcoder2`.
-- **Evaluator**: ordered `reference`, `spec`, `numeric`, and `behavioral`
-  stages for repo-to-repo observational equivalence.
-- **Main launcher**: `bash ./run_interactive_attempt.sh`.
-- **Attempt outputs**: `dataset/.attempt_docker/`.
+![T2J-BENCH workflow](figures/bench.png)
 
-The benchmark focuses on full training-pipeline conversion, not isolated
-function translation. Each task gives an agent a PyTorch source repository and a
-minimum-constraint prompt. The agent must produce a JAX repository that can be
-compared against the source through the fixed external evaluator.
+## Start here
 
+1. [Prepare the host](#requirements).
+2. [Fetch the frozen references and build one task](#quick-start).
+3. [Run an agent](#running-an-evaluation).
+4. [Inspect the reward and diagnostics](#reading-results).
 
-## Repository Layout
-
-| Path | Purpose |
-| --- | --- |
-| `dataset/{sft,dpo,ppo}/<model>/torch_orig/` | PyTorch source repos used as conversion references. |
-| `dataset/instructions/` | Frozen minimum-constraint prompts for SFT, DPO, and PPO tasks. |
-| `dataset/eval/` | Staged PyTorch-vs-JAX equivalence evaluator. |
-| `coding-agent/` | ADK-based coding-agent scaffold, tools, Docker image files, runner scripts, and tests. |
-| `run_interactive_attempt.sh` | Interactive launcher for benchmark attempts and optional evaluation. |
-| `call_agent.py` | In-container CLI entry point for ADK-based agents. |
-| `requirements.txt` | Host `lf` environment requirements, including CUDA PyTorch/JAX wheels. |
-
-Generated artifacts are intentionally kept out of the source tree:
-
-```bash
-dataset/.attempt_docker/
-```
-
-## Reference Environment
-
-The benchmark was developed and tested on the system below. Other
-configurations may work, but this is the environment used for the reported
-results.
-
-| Component | Specification |
-| --- | --- |
-| OS | Debian GNU/Linux 11 (bullseye) |
-| Kernel / Arch | 5.10.0 (cloud) / x86_64 |
-| CPU | 2x Intel Xeon @ 2.20GHz (96 vCPUs) |
-| Memory | ~1.3 TiB |
-| GPU | 8x NVIDIA A100-SXM4-80GB (80 GB each) |
-| NVIDIA driver | 550.90.07 (supports CUDA 12.4) |
-| Docker | 20.10.17 |
-| Python (`lf` env) | 3.11.15 |
-| PyTorch | 2.12.0+cu126 |
-| JAX | 0.10.1 (CUDA 12) |
-
-Each attempt requests 2 GPUs by default.
+To inspect the code, you do not need a GPU or the large reference artifacts. To build
+verifier images or grade a candidate, you need the references and model weights.
 
 ## Requirements
 
-The attempt workflow is designed for a Linux or WSL shell with GPU-enabled
-Docker. Before running attempts, make sure you have:
+Use a Linux host with Docker, NVIDIA Container Toolkit, Docker Compose v2, Bash 4+, GNU
+coreutils, and `flock`. Verify GPU access with `docker run --gpus all` before building.
+Install [Git LFS](https://git-lfs.com/), Python 3.10+ for the host tools, and
+[uv](https://docs.astral.sh/uv/) for the Harbor CLI.
 
-- Docker daemon access through either `docker` or `sudo -n docker`.
-- NVIDIA Container Toolkit if using GPUs.
-- A local conda environment named `lf`.
-- `conda-pack` available in that environment.
-- Editable source trees used by the Docker image build:
-  - `adk-python/src` from this repo's vendored custom ADK fork.
-  - `$HOME/LlamaFactory/src` from a separately cloned LlamaFactory checkout.
-- Provider credentials for whichever agent you run.
-- Hugging Face access for any gated model weights you evaluate.
+### Benchmark configuration
 
-## Quick Start
+The released evaluation uses the following per-task configuration. The runner and
+inference verifier enforce the pinned GPU configuration; using another GPU requires
+updating those checks and validating the frozen references on that device.
 
-Run the following from the repository root.
+| Resource | Per task |
+| --- | --- |
+| GPU | 1 × NVIDIA H100 80GB HBM3 (SXM) |
+| CPU | 24 cores |
+| RAM | 200 GiB (`memory_mb = 204800`) |
+| Agent timeout | 3 hours |
+| Verifier timeout | 1 hour |
 
-### 1. Create the Host Environment
+### Storage and parallel runs
 
-LlamaFactory's current `main` requires Python `>=3.11`, so the reference setup
-uses Python 3.11.
+Allow disk space for:
 
-```bash
-conda create -n lf python=3.11 -y
-conda activate lf
+- Frozen references: approximately **19 GiB** checked out, plus **14 GiB** of unique
+  objects in `.git/lfs/objects`.
+- Model weights: approximately **105 GB** for the 15 training models, plus the
+  inference-only models. Weights are included in Docker images.
+- Docker layers, agent outputs, and evaluation logs.
 
-git clone https://github.com/hiyouga/LlamaFactory.git "$HOME/LlamaFactory"
-pip install -e "$HOME/LlamaFactory"
+Each simultaneous trial needs its own GPU and CPU/RAM allocation. The runner serializes
+unassigned GPU trials with a host lock. To use a specific GPU, set
+`T2J_GPU_DEVICE_IDS`; coordinate device assignments yourself when running in parallel.
 
-pip install -e ./adk-python
+## Quick start
 
-# Install after the editable packages so CUDA 12 torch overrides any default
-# torch wheel pulled by LlamaFactory.
-pip install -r requirements.txt
-```
-
-The evaluator and helper code in `run_interactive_attempt.sh` run on the host,
-not inside the attempt container. The launcher automatically prefers an `lf`
-environment found under `.conda`, `miniconda3`, or `/opt/conda`. To point it at
-a specific interpreter:
+Start with `dpo_bloom`, which does not require access to a gated model.
 
 ```bash
-CODING_AGENT_PYTHON_BIN="$HOME/.conda/envs/lf/bin/python" bash ./run_interactive_attempt.sh
+# Clone without downloading the large reference artifacts during checkout.
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/google-research/t2j-bench.git
+cd t2j-bench
+
+# Install the supported Harbor version and the host-side data tools.
+uv tool install --python 3.12 harbor==0.20.0
+python3 -m pip install -U huggingface_hub 'PyYAML==6.0.3'
+
+# Configure the Hugging Face bucket transfer agent and fetch this task's references.
+tools/setup_lfs.sh
+git lfs pull --include='tasks/dpo_bloom/tests/golden/**'
+python3 tools/check_goldens.py tasks/dpo_bloom
+
+# Build the task's base, weight, agent, and verifier images.
+./build_harbor_images.sh --with-bases dpo_bloom
+
+# Set your provider credentials in the shell, then run one attempt.
+AGENT_ENV=ANTHROPIC_API_KEY ./run_eval.sh dpo_bloom
 ```
 
-Create the default agent environment file if you plan to use `client_agent` or
-`iterative_agent`:
+Harbor requires Python 3.12 or newer and is pinned to **0.20.0** because `tools/patch_harbor.py` applies version-specific
+GPU allocation and artifact-scrubber patches. `run_eval.sh` applies them idempotently
+and checks that they took effect. Upgrade Harbor only after updating and validating
+these patches.
+
+For a gated checkpoint such as Gemma, Llama, or PaliGemma, obtain access on Hugging Face
+and configure `HF_TOKEN`, `HF_TOKEN_FILE`, or the normal Hugging Face token file before
+building. Tokens are passed to the weight build as BuildKit secrets. See
+[base_image/README.md](base_image/README.md) for base tiers and host-side weight setup.
+
+### Frozen references
+
+`tasks/<task>/tests/golden/` contains the reference inputs, outputs, gradients, and
+trajectories. Git stores LFS pointers; the object bytes are in the public
+[Hugging Face bucket](https://huggingface.co/buckets/jiefengcgg/t2j-bench).
+Public downloads do not need a token.
 
 ```bash
-cp coding-agent/coding_agent/.env.example coding-agent/coding_agent/.env
+git lfs pull                                      # all tasks
+git lfs pull --include='tasks/core_llama3/tests/golden/**'  # one inference task
 ```
 
-Then fill in provider settings such as `GOOGLE_CLOUD_PROJECT` and
-`CODING_AGENT_MODEL`. For `codex`, `gemini`, and `claude`, the interactive
-launcher can also use your shell environment or a custom env file.
+Run `tools/setup_lfs.sh` once per clone. It configures `tools/lfs_hf_bucket.py` as the
+repository's local Git LFS transfer agent. Download references **before** building
+verifier images: each verifier includes its own copy, so fetching newer files also
+requires rebuilding the corresponding image.
 
-### 2. Check CUDA
+`tools/check_goldens.py` checks the task manifest and rejects unresolved LFS pointers.
+Its exit codes are `0` for complete data, `1` for missing data, and `2` when the
+configuration or dependencies prevent the check. If the host lacks PyYAML, the shell
+scripts print a warning and use a weaker presence check; install PyYAML for the full
+check. Set `GOLDEN_PYTHON` if these tools use a separate Python environment.
+
+## Running an evaluation
 
 ```bash
-python -c "import torch; print(torch.cuda.is_available())"
-python -c "import jax; print(jax.devices())"
-pip check
+./run_eval.sh [TASK] [-- extra Harbor flags...]
+
+AGENT_ENV=ANTHROPIC_API_KEY ./run_eval.sh dpo_bloom
+AGENT_ENV=ANTHROPIC_API_KEY ./run_eval.sh core_llama3
+AGENT_ENV=ANTHROPIC_API_KEY MODEL=claude-sonnet-5 ./run_eval.sh sft_qwen2
+./run_eval.sh dpo_bloom -- --debug
 ```
 
-`torch.cuda.is_available()` should print `True`, `jax.devices()` should show
-CUDA devices, and `pip check` should report no broken requirements.
+The default task is `dpo_bloom`. The agent runs in a networked GPU container and writes
+`/workspace/jax_repo`. Harbor transfers that artifact to a separate, torch-free,
+no-network verifier, which runs the task's `tests/test.sh` and writes `reward.json`.
+Model weights are already in both images under `/data/{repo_id}`.
 
-`requirements.txt` pins CUDA 12.6 PyTorch wheels (`torch==2.12.0+cu126`,
-`torchvision==0.27.0+cu126`, `torchaudio==2.11.0+cu126`) and installs
-`jax[cuda12]`. If your NVIDIA driver needs a different CUDA build, adjust the
-PyTorch index URL and `+cuXXX` pins before installing.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AGENT` | `claude-code` | Harbor agent |
+| `MODEL` | `claude-opus-5` | Agent model |
+| `AGENT_ENV` | Empty | Comma- or space-separated host variable names to forward |
+| `N_CONCURRENT` | `1` | Harbor trial concurrency |
+| `MAX_RETRIES` | `1` | Retries for transient trial errors |
+| `JOBS_DIR` | `jobs` | Output directory |
+| `GOLDEN_PYTHON` | Authoring venv if present, otherwise `python3` | Manifest-check interpreter |
+| `T2J_GPU_DEVICE_IDS` | Unset | Comma-separated GPU IDs for this invocation |
+| `LOCKDIR` | `/tmp/t2j-jaxtrain-gpu.locks` | Host GPU lock directory |
+| `T2J_ALLOW_CONCURRENT` | `0` | Bypass the host lock; caller manages GPU exclusivity |
 
-### 3. Build the Docker Image
+### Agent credentials
+
+The runner supplies no provider credentials. Container-side agents such as `claude-code`
+need their credential variables forwarded through `AGENT_ENV`. Host-side LiteLLM
+agents such as `terminus-2` read the host environment directly.
 
 ```bash
-bash coding-agent/docker/coding_agent_lf/build_image.sh coding-agent-lf:latest
+# Direct Anthropic credentials, already exported in your shell.
+AGENT_ENV=ANTHROPIC_API_KEY ./run_eval.sh dpo_bloom
+
+# Gateway credentials, already exported in your shell.
+AGENT_ENV='ANTHROPIC_BASE_URL,ANTHROPIC_AUTH_TOKEN' ./run_eval.sh dpo_bloom
+
+# Host-side model calls use the provider's normal environment variables.
+AGENT=terminus-2 MODEL=gemini-3.1-pro-preview ./run_eval.sh dpo_bloom
 ```
 
-The build script packages the host `lf` conda environment, copies editable ADK
-and LlamaFactory sources into the Docker build context, and builds
-`coding-agent-lf:latest`.
+Forwarded variables become Harbor `--ae NAME=VALUE` arguments. The runner redacts values
+in its printed command, but they are present in the running process's arguments.
+Harbor's persisted-config scrubber recognizes secret-like variable names containing
+`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `CREDENTIAL`, or `AUTH`; use those names for secrets.
 
-If LlamaFactory or `conda-pack` lives somewhere else:
+## What is evaluated
+
+Training tasks cover SFT, DPO, and PPO across 15 model families. The agent implements
+checkpoint conversion, model computation, gradients, data processing, and real training
+steps in JAX/Flax/Optax. Conversion must read the raw checkpoint without importing PyTorch.
+The model list and Hugging Face repository IDs are in
+[base_image/models.txt](base_image/models.txt).
+
+Inference tasks cover Llama 3, Qwen2, Qwen3, GPT-OSS, Gemma 4, and Qwen2.5-VL.
+`core` evaluates a single-sequence paged-cache engine; `ragged` adds requests of different
+lengths; `chunked` adds chunked prefill and prefix reuse. Checks cover paged KV caches,
+block tables, sampler transforms, and greedy decode.
+
+| Stage | Role | Examples |
+| --- | --- | --- |
+| Spec | Structural gate | Torch independence, checkpoint conversion, shapes, interfaces |
+| Numeric | Continuous fidelity | Logits, module outputs, training losses and gradients |
+| Behavioral | Fidelity and invariants | Training trajectories, masking, deterministic decode, cache behavior |
+
+For a complete evaluation with both scored dimensions:
+
+```text
+reward = spec_pass_rate × (0.5 × numeric_score + 0.5 × behavior_score)
+```
+
+`spec_pass_rate` is the fraction of Spec checks that pass. Numeric and behavioral scores
+aggregate per-check similarities using a low-tail-sensitive power mean (`p = 0.5`), so
+weak checks reduce the dimension score more than an arithmetic mean would. The reducer
+renormalizes the equal weights over dimensions with scored checks; no scored dimension
+or no passing Spec checks yields zero reward. Binary pass counts are diagnostics, not
+the continuous reward.
+
+The verifier is separate from the agent environment, but it executes candidate code.
+This release is not a general-purpose sandbox for hostile submissions: the training
+verifier runs pytest as root, while the inference verifier drops privileges and protects
+the reducer. Candidate-visible artifacts and in-process measurements still require
+careful interpretation when evaluating adversarial agents.
+
+## Reading results
+
+```text
+jobs/<run>/
+├── result.json                       # Job-level results
+└── <task>__<id>/
+    ├── agent/trajectory.json         # Agent actions
+    ├── artifacts/workspace/jax_repo/ # Migrated repository
+    └── verifier/
+        ├── reward.json               # Reward and diagnostics
+        └── test-stdout.txt            # Grader output
+```
+
+Read `verifier/reward.json` together with the grader output. A training-task example:
+
+```json
+{
+  "reward": 0.5325,
+  "spec_pass_rate": 0.75,
+  "numeric_score": 0.82,
+  "behavior_score": 0.60,
+  "n_numeric": 21,
+  "n_behavioral": 16,
+  "overall": 0
+}
+```
+
+Training tasks also emit flattened per-check similarity keys. Inference tasks use
+`numeric_n` and `behavior_n` for dimension counts and include per-stage binary gates,
+counts, and `pass_rate`. `overall` and `pass_rate` do not determine the reward.
+An inference host/harness precheck failure can produce **no reward file**: inspect the
+log before treating an absent grade as a candidate score of zero.
+
+## Grading a candidate without an agent
+
+Use the already-built per-task verifier on the same supported GPU hardware. For example,
+to grade the committed training reference:
 
 ```bash
-CODING_AGENT_LLAMAFACTORY_SRC=/path/to/LlamaFactory/src \
-CODING_AGENT_CONDA_PACK_BIN=/path/to/conda-pack \
-bash coding-agent/docker/coding_agent_lf/build_image.sh coding-agent-lf:latest
+mkdir -p out/dpo_bloom
+docker run --rm --gpus all --network none \
+  -v "$PWD/tasks/dpo_bloom/solution/ref_jax_repo:/workspace/jax_repo:ro" \
+  -v "$PWD/out/dpo_bloom:/logs/verifier" \
+  --entrypoint bash t2j-verifier:dpo-bloom /tests/test.sh
 ```
 
-### 4. Verify the Image
+Replace the first mount's source with your candidate's `jax_repo` directory. For an
+inference task, use its solution directory and verifier tag, for example
+`t2j-inference-verifier:core-llama3`. Task image tags replace the first underscore for
+training tasks and every underscore for inference tasks.
 
-Quick import check:
+## Repository layout
 
-```bash
-sudo -n docker run --rm \
-  --mount type=bind,src="$(pwd)",dst=/opt/t2j_bench,readonly \
-  coding-agent-lf:latest \
-  bash -lc 'PYTHONPATH=/opt/t2j_bench/coding-agent python -c "import coding_agent, tools; print(\"ok\")"'
+```text
+base_image/                 # Shared base/weight images, pins, and model preparation
+tasks/<task>/
+├── instruction.md          # Agent-facing migration contract
+├── task.toml               # Harbor environments, artifacts, and resource limits
+├── environment/
+│   ├── Dockerfile          # Agent image
+│   └── torch_orig/         # Source PyTorch repository
+├── tests/
+│   ├── Dockerfile          # Verifier image
+│   ├── test.sh             # Grading entrypoint
+│   ├── test_*.py           # Spec, Numeric, and Behavioral checks
+│   ├── _t2j/               # Task-local grader helpers
+│   ├── summary_to_reward.py
+│   └── golden/             # Git LFS reference artifacts
+└── solution/ref_jax_repo/   # Reference JAX implementation; excluded from images
+tools/
+├── setup_lfs.sh            # Configure bucket-backed Git LFS transfers
+├── lfs_hf_bucket.py        # LFS transfer agent
+├── check_goldens.py        # Shared build/run manifest check
+└── patch_harbor.py         # Supported Harbor compatibility patches
+build_harbor_images.sh       # Build task images; --help lists options
+run_eval.sh                  # Run an attempt; --help lists usage
 ```
 
-GPU/JAX check:
-
-```bash
-sudo -n docker run --rm --gpus all coding-agent-lf:latest \
-  bash -lc 'python - <<'"'"'PY'"'"'
-import jax
-print(jax.__version__)
-print(jax.devices())
-PY'
-```
-
-Use plain `docker` instead of `sudo -n docker` if your user already has Docker
-daemon access.
-
-### 5. Run an Attempt
-
-```bash
-bash ./run_interactive_attempt.sh
-```
-
-For a small smoke run, choose:
-
-- training method: `sft`
-- model: `bloom`
-- agent: `client_agent`
-- Docker image: `coding-agent-lf:latest`
-- pytest evaluation: disabled
-
-The launcher prompts for task/model, agent, env profile, model override, Docker
-image, GPU mapping, verbose/yolo mode, optional pytest evaluation, and optional
-batch resume settings.
-
-## Hugging Face Access
-
-The evaluator downloads model weights from Hugging Face. Gated models, for
-example `google/gemma-3-4b-it` used by `sft/gemma3`, require a token whose
-account has accepted the model license.
-
-Attempt containers bind-mount the host `~/.config/gcloud` and
-`~/.cache/huggingface` directories, so host authentication is visible inside the
-container.
-
-1. Accept the model license on its Hugging Face page while logged in.
-2. Log in on the host:
-
-```bash
-hf auth login
-# or, if the CLI is not on PATH:
-conda run -n lf hf auth login
-```
-
-Verify access before running an attempt:
-
-```bash
-conda run -n lf python -c "from huggingface_hub import whoami; print(whoami()['name'])"
-```
-
-Ungated models such as `sft/bloom` do not need a token.
-
-### Pre-download cache-only models
-
-Most references download weights on demand, but `llava_next` uses a cache-only
-loader (`snapshot_download(..., local_files_only=True)`), so its model must be
-present in the Hugging Face cache beforehand or its reference fails with
-`Tokenizer file not found: .../tokenizer.json`. Pre-download it once (it is
-ungated; the cache is shared with attempt containers):
-
-```bash
-hf download llava-hf/llava-v1.6-vicuna-7b-hf
-# or, if the CLI is not on PATH:
-conda run -n lf hf download llava-hf/llava-v1.6-vicuna-7b-hf
-```
-
-## Running Attempts
-
-### Interactive Launcher
-
-The recommended entry point is:
-
-```bash
-bash ./run_interactive_attempt.sh
-```
-
-Supported training-method choices are `sft`, `dpo`, `ppo`, and `all`.
-Supported top-level agents are `client_agent`, `iterative_agent`, `codex`,
-`gemini`, and `claude`.
-
-For `client_agent`, `codex`, `gemini`, and `claude`, the launcher stages an
-isolated candidate repository and archives the final candidate as:
-
-```bash
-dataset/.attempt_docker/<model>_<task>_<timestamp>/jax_repo/
-```
-
-Batch runs write logs under:
-
-```bash
-dataset/.attempt_docker/batch_runs/
-```
-
-### Direct Docker Runner
-
-For custom automation, call the lower-level runner directly:
-
-```bash
-python coding-agent/scripts/run_attempt_in_docker.py \
-  --image coding-agent-lf:latest \
-  --workspace dataset \
-  --mount sft/gemma3:sft/gemma3 \
-  --prompt-file dataset/instructions/sft.md \
-  --agent client_agent \
-  --attempt-root dataset/.attempt_docker/gemma3_sft_manual \
-  --gpus device=0,1 \
-  --verbose
-```
-
-Useful options:
-
-- `--mount RELPATH` mounts selected workspace paths into the container.
-- `--prompt` or `--prompt-file` supplies the conversion instruction.
-- `--agent` selects `client_agent`, `iterative_agent`, `codex`, `gemini`, or
-  `claude`.
-- `--gpus none` disables GPU passthrough.
-- `--dry-run` prints the Docker command without executing it.
-
-Prebuilt wrappers for selected tasks live in:
-
-```bash
-coding-agent/docker/coding_agent_lf/attempt_scripts/
-```
-
-Example:
-
-```bash
-bash coding-agent/docker/coding_agent_lf/attempt_scripts/run_sft_gemma3.sh
-```
-
-## Evaluating a Candidate JAX Repo
-
-The interactive launcher can generate the evaluator config and run pytest for
-you. To run evaluation manually, use `dataset/eval`.
-
-Example for an SFT candidate:
-
-```bash
-cd dataset/eval
-
-XLA_PYTHON_CLIENT_PREALLOCATE=false CUDA_VISIBLE_DEVICES=0,1 \
-python -m lib.generate_config \
-  sft \
-  ../sft/gemma3/torch_orig \
-  ../.attempt_docker/gemma3_sft_manual/jax_repo \
-  --config-out configs/local_sft_gemma3.yaml \
-  --output-dir outputs/local_sft_gemma3 \
-  --no-run
-
-XLA_PYTHON_CLIENT_PREALLOCATE=false CUDA_VISIBLE_DEVICES=0,1 \
-python -m pytest -q tests/test_eval_pipeline.py \
-  --eval-config configs/local_sft_gemma3.yaml
-```
-
-Each evaluation writes:
-
-- `new_eval_report.json`: full staged report with compared artifacts.
-- `new_eval_summary.json`: compact pass/fail summary.
-
-Interpret stage failures in order:
-
-1. Fix `reference` before comparing repositories.
-2. Fix `spec` before tuning numeric behavior.
-3. Treat skipped or missing `behavioral` artifacts as real failures, not
-   success.
-
-For evaluator design details, see `dataset/eval/README.md`.
-
-## Adding a New Agent
-
-An "agent" is the system under test. It receives a frozen instruction prompt,
-writes a converted JAX repo, and is evaluated externally.
-
-Inside the container, every agent must honor the same contract:
-
-- **Prompt**: the rendered instruction is available under `/attempt_meta/`.
-  Treat it as the only task guidance.
-- **Workspace**: the working directory is `/attempt_workspace`.
-- **Source repo**: the PyTorch reference is mounted at
-  `/attempt_workspace/<task>/<model>`.
-- **Candidate repo**: the converted repository must be written to
-  `/attempt_workspace/jax_repo`.
-- **Credentials**: model-provider and Hugging Face credentials are mounted from
-  the host environment/profile selected by the launcher.
-- **Done condition**: success means a populated `jax_repo/`; the agent does not
-  need to return a special value.
-
-There are two common integration paths.
-
-### Option A: External CLI Agent
-
-Use this pattern for an agent that reads a prompt on stdin and edits files in
-the current directory, like the existing `codex`, `gemini`, and `claude`
-integrations.
-
-1. Install the CLI in `coding-agent/docker/coding_agent_lf/Dockerfile`, then
-   rebuild the image.
-2. Add `_build_<name>_exec_command(...)` in
-   `coding-agent/scripts/run_attempt_in_docker.py`, modeled on the existing
-   Codex/Gemini/Claude builders.
-3. Add `<name>` to the runner's `--agent` choices and dispatch branch.
-4. Add home-directory, settings, or auth mounts if your CLI needs them.
-
-### Option B: In-Process ADK Agent
-
-Use this pattern for a Python agent built on the vendored Google ADK fork, like
-`client_agent` and `iterative_agent`.
-
-1. Create a package under `coding-agent/` with an `agent.py` exposing
-   module-level `root_agent`.
-2. Reuse tools from `coding-agent/tools/` when possible:
-   `fs_tools`, `bash_exec`, `lsp_tool`, `todo_tools`, and related helpers.
-3. Register the agent in `call_agent.py`.
-4. Add the agent to `coding-agent/scripts/run_attempt_in_docker.py`.
-
-Pure-Python agent changes usually do not require a Docker rebuild because
-`coding-agent/` is mounted into the container on `PYTHONPATH`. Rebuild only when
-you add dependencies to the `lf` environment.
-
-### Expose the Agent in the Interactive Launcher
-
-For either integration path, update `run_interactive_attempt.sh`:
-
-- Add `<name>` to the `Choose top-level agent` menu.
-- Add an env-profile/default-model branch if needed.
-- Add `<name>` to `agent_uses_staged_jax_repo` so the produced `jax_repo/` is
-  archived for evaluation.
-
-Then run it with:
-
-```bash
-bash ./run_interactive_attempt.sh
-```
-
-## Vendored `adk-python`
-
-`adk-python/` is a vendored fork of
-[google/adk-python](https://github.com/google/adk-python), based on
-`google-adk` 1.27.2. The coding agent depends on local modifications that are
-not part of an official ADK release, so the fork travels with this repo.
-
-Important local changes include:
-
-- Tool-result formatting for model-readable `read_file`, `search`,
-  `patch_file`, `lsp`, evaluator, and related tool outputs.
-- Large tool-output offloading to workspace files with compact head/tail
-  summaries.
-- Anthropic/Claude request handling for output tokens, thinking configuration,
-  and long streaming final responses.
-- Thought-signature preservation gated by `ADK_PRESERVE_THOUGHT_SIGNATURES`.
-- Gemini/Vertex client selection from environment/model name.
-- Verbose tool-call, result, and usage rendering for attempt logs.
-- Minor tweaks to planning, LiteLLM handling, and GCP IAM connector removal.
-
-## Useful Checks
-
-Check shell and Python syntax:
-
-```bash
-bash -n run_interactive_attempt.sh
-bash -n coding-agent/docker/coding_agent_lf/build_image.sh
-python -m py_compile call_agent.py coding-agent/scripts/run_attempt_in_docker.py
-```
-
-Inspect the current Docker image:
-
-```bash
-sudo -n docker image inspect coding-agent-lf:latest
-```
-
-Validate evaluator configs:
-
-```bash
-cd dataset/eval
-python -m lib.validate_configs
-```
-
-## Notes
-
-- Existing attempt outputs can be resumed or skipped when running `all` or all
-  models for one task.
-- `dataset/eval` is reference-first: `torch_orig` defines the contract, and the
-  JAX candidate must match that contract through repo-owned entry points.
-- The benchmark verifier is fixed and external to the agent. Agent self-reports
-  are diagnostic logs, not benchmark pass/fail labels.
+Task-local helper copies are intentional: each task image must be self-contained.
+Keep identical copies synchronized when changing shared grader code. Training and
+inference use different JAX/Flax pins; see the [base-image guide](base_image/README.md).
 
 ## Citation
 
 ```bibtex
-@article{song2026converted,
-  title={Converted, Not Equivalent: Benchmarking Codebase Conversion via Observational Equivalence},
-  author={Song, Linxin and Chen, Jiefeng and Huang, Yue and Mishra, Bhavana Dalvi, and Wang, Chi and Zhao, Jieyu and Yoon, Jinsung and Pfister, Tomas},
+@article{t2jbench2026,
+  title={T2J-BENCH: Benchmarking Coding Agents on Execution-Grounded PyTorch-to-JAX Repository Migration},
+  author={Feng, Tao and Chen, Jiefeng and Song, Linxin and Zhuang, Yufan and Huang, Yue and Mishra, Bhavana Dalvi and Wang, Chi and Tang, Xiangru and Zhao, Jieyu and Liu, Ge and Pfister, Tomas and Yoon, Jinsung},
   journal={arXiv preprint arXiv:2605.29054},
   year={2026}
 }
@@ -482,13 +312,10 @@ python -m lib.validate_configs
 
 ## License
 
-Apache 2.0 License. See [`LICENSE`](LICENSE) for details.
+Apache 2.0. See [LICENSE](LICENSE) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Disclaimer
 
-This is not an officially supported Google product. This project is not
-eligible for the
+This is not an officially supported Google product. This project is not eligible for the
 [Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security).
-
-This project is intended for demonstration purposes only. It is not intended for
-use in a production environment.
+This project is intended for demonstration purposes only, not production use.

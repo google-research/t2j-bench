@@ -1,0 +1,5 @@
+# Build context for the base images (base_image/ only; per-task builds use the repo root's
+# .dockerignore).
+**/__pycache__
+**/*.pyc
+README.md

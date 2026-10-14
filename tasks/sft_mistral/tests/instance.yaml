@@ -1,0 +1,111 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Resolved instance config (provenance / regeneration) for sft/mistral.
+# Provenance record for the generated tests/ tree.
+# Paths are relative to this file's directory (the instance test/ dir).
+training_method: sft
+model: mistral
+
+# Per-parameter grad-norm tolerance override. The layer-0 attention
+# projections' gradient norms are not determined to the default 0.3 at bf16 -- not
+# across frameworks, and not even within one. Differentiating this instance's own
+# reference repo twice in JAX, changing NOTHING but the working precision, moves them
+# by more than 100%:
+#
+#   leaf                                  jax bf16   jax f32   torch bf16 (golden)
+#   layers.0.self_attn.q_proj              19.1792    8.7932    9.3464
+#   layers.0.self_attn.k_proj              19.0584    9.6338   10.0505
+#   layers.1.self_attn.q_proj              11.7263    9.5795    9.6973
+#   layers.0.self_attn.o_proj              55.6918   49.1671   48.1777
+#   embed_tokens                          190.9174  169.5143  163.7545
+#
+# layer-0 q_proj is both the worst-conditioned leaf and the ONE leaf the 0.3 gate
+# rejects, and the candidate's bf16 value is a faithful bf16 value. dL/dW_q and dL/dW_k
+# both pass through the attention softmax, which is shift-invariant, so they are
+# differences of nearly-cancelling terms; the cancellation is worst where the attention
+# is flattest, which is why layer 0 stands out and layers 2-31 do not. Note the last
+# column: torch's bf16 golden tracks JAX's *float32* answer on every row, because
+# torch's attention backward keeps the softmax and its statistics in fp32 while a
+# straightforward flax port rounds them to bf16 -- an implementation choice the
+# benchmark deliberately does not dictate. Grading a leaf that swings 2.2x on that
+# choice is grading a coin flip.
+# The total grad_norm (1002.16 golden vs 1033.60 candidate), the forward logits, and
+# gradient authenticity (analytic == finite-difference) all pass -- the gradient is
+# right, the per-leaf split of it is below the resolution of bf16. This costs almost no
+# discrimination: with a correct solution exactly one leaf exceeds 0.3, and the next
+# largest per-leaf error is under 0.25. dpo/ppo_mistral keep the strict 0.3 default:
+# their preference/value objectives do not put this much of the gradient through the
+# shallow softmax. See sft_qwen2_vl for the same effect at 0.5.
+grad_rel_tol: 1.5
+
+# Determinism + sizes (snapshotted from the authoring template at generation time).
+seed: 42
+batch_size: 1
+max_eval_examples: 2
+loss_trajectory_steps: 3
+
+# ...of which test_loss_trajectory compares the first 2. The replay is bare SGD
+# (p <- p - lr*g, no optimizer state, no gradient clipping), and on this instance it
+# leaves the regime where it is determined before step 2: the loss turns back UP and the
+# gradient norm explodes. Replaying it three ways -- the frozen torch curve, and the
+# reference repo in JAX at bf16 and at float32, same batch, same schedule
+# ([1e-6, 7.5e-7, 2.5e-7]), differing only in rounding:
+#
+#                          step 0    step 1    step 2  |   grad norms
+#   torch bf16 (golden)    5.9588    5.2735    7.4400  |   1002 / 1743 / 12367
+#   jax   bf16 (candidate) 5.9752    5.3216    8.9334  |   1034 / 1657 /  7588
+#   jax   float32          5.9538    5.1084    8.3392  |   1013 / 1930 /  9690
+#
+# Steps 0 and 1 agree to 0.016 and 0.048 -- comfortably inside the 0.1 + 0.1*|ref| gate.
+# At step 2 the three disagree by 1.49, and 0.59 of that is JAX against ITSELF with
+# nothing changed but the working precision, so no cross-framework tolerance can
+# separate a wrong training loop from rounding there: the step-1 update lands the params
+# where the gradient is 7-12x larger, and a 10% difference in that update is a 20%
+# difference in the loss that follows. Comparing the tail would only measure how far the
+# amplification went. Nothing is skipped silently -- the candidate still runs all three
+# steps and all three must be finite, and test_train_trajectory grades the same three
+# steps through the REAL loop (optax AdamW, gradient clipping, fp32), which is stable and
+# passes. dpo/ppo_mistral do not need this: their replays stay in the determined regime.
+loss_trajectory_compare_steps: 2
+
+generation_max_new_tokens: 8
+compare_hidden_states: true
+# Hard wall-clock budget (seconds) for the repo's OWN training loop, enforced
+# by the grader's test_train_loss_trend. It is a config knob, NOT a
+# frozen artifact: golden-free, so changing it never moves a golden. It catches a port
+# that never terminates (no jit, per-step recompilation, a runaway loop) -- not
+# micro-timing. Uniform 1200s, derived from torch_orig's training time (every torch run
+# is <=~665s; ~1.8x headroom covers a JAX port's one-time XLA compile), NOT from the JAX
+# reference -- a slow reference JAX run is not the oracle and must not inflate the budget.
+train_timeout_s: 1200
+sandbox_timeout_s: 1200
+
+# Conventional layout. shared_config is pulled from
+# the authoring model registry at generation time
+# and snapshotted into golden/meta.json for provenance.
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden
+
+# LlamaFactory's default finetuning_type is LoRA, and torch_orig trains that way;
+# these tests migrate the same LoRA training rather than full finetuning. The base
+# weights are frozen (no gradients / optimizer state) and only low-rank adapters are
+# trained, which keeps both the torch reference and the JAX port on a single GPU.
+# Adapters target all linear projections (rank 8, alpha 16, scale = alpha/rank).
+shared_config_overrides:
+  finetuning_type: lora
+  lora_rank: 8
+  lora_alpha: 16
+  lora_target: all

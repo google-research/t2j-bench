@@ -1,0 +1,292 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# core/gemma4 -- the instance's own data. The grader hardcodes nothing
+# per-instance: the freezer mirrors every key here into
+# golden/meta.json and `tests/fixtures.py` reads it back from there.
+#
+# Every key is checked against the freezer's known instance keys, so a
+# typo is a refusal rather than a silently-defaulted value.
+
+mode: core
+model: gemma4
+model_name_or_path: google/gemma-4-E2B-it
+
+# NO `is_moe` AND NO `multimodal`, and both absences are deliberate rather than
+# oversights. gemma-4-E2B declares `enable_moe_block: false` and
+# `num_experts: null` (the 26B-A4B sibling is the MoE one), and this instance is
+# the TEXT PATH ONLY of a tri-modal checkpoint -- see tests/instance_context.md,
+# which is the one place in the tree that states that scope. Both keys are
+# family-scoped in the harness's per-family symmetry waivers and
+# declaring either here would be a claim about a surface this instance does not
+# grade.
+
+# --------------------------------------------------------------------------- #
+# Precision.
+# --------------------------------------------------------------------------- #
+# The serving tier, as for every instance in this class.
+precision_profile: bf16_native
+dtype: bfloat16
+
+# EVERY VALUE BELOW IS MEASURED ON THIS INSTANCE, by the graded suite's own
+# gates, by a pytest plugin that
+# records what `check_array`, `centered_cosine`, `check_logits_strict` and the
+# four behavioural readers actually saw, rather than a numpy reimplementation of
+# them. One run, reference-as-candidate, fp32 matmul precision and the
+# graded autotune pin. The multiple each declared value carries over its
+# measured floor is stated beside it; where a value coincides with the
+# class-wide one that is a RESULT, not an inheritance.
+fp32_thresholds:
+  abs_tol: 1.0e-4                    # floor 2.6917e-05 (global_rotary_emb.out0) -- 3.7x
+  centered_cosine_floor: 0.9999995   # measured 1.00000012 on fp32_prefill_logits
+  logprob_atol: 4.0e-04              # measured 2.1815e-05 -- 18x
+  # TIGHTENED FROM THE CLASS-WIDE 1.7e-03, which carried 76x here. Set to the
+  # same 18x multiple as the per-token row above, since the two are the same
+  # measurement summed differently and there is no reason for their headroom to
+  # differ by a factor of four.
+  logprob_cumulative_atol: 4.0e-04   # measured 2.2441e-05 -- 18x
+  held_out_logprob_atol: 7.5e-04     # measured 7.9632e-05 -- 9.4x
+  # TIGHTENED FROM THE CLASS-WIDE 4.0e-03 (27x here) to 10x.
+  held_out_seq_atol: 1.5e-03         # measured 1.4489e-04 -- 10x
+
+native_thresholds:
+  # FLOOR 0.0: `check_logits_strict` reports ZERO decisive argmax
+  # disagreements at every rung of the ladder, on all twelve logit surfaces
+  # (prefill, both decode-prefill consistency legs, and the eight decode steps).
+  # There is exactly ONE exact tie, on prefill_logits -- a row no declared value
+  # can ever convict. The class-wide 0.1875 is kept because the floor gives it
+  # no information: nothing here would fail at any margin.
+  argmax_margin: 0.1875
+  # The golden's SMALLEST decode margin is 0.3125, and this key is a CEILING --
+  # the check excuses a divergence only BELOW it. At 0.125 nothing is excused,
+  # which is the strongest position available.
+  decisive_margin: 0.125
+  # BOTH SURFACES, and this is a LOOSENING of the class-wide 0.998 that the
+  # first oracle grade forced: `_assert_logit_parity` measures 0.9946502447 on
+  # prefill_logits, so 0.998 fails a correct port. 1 - 0.99 is 1.87x the
+  # measured (1 - cos) of 5.350e-03, which is the ratio `core_gpt_oss` (1.6x)
+  # and `chunked_gpt_oss` (1.72x) both used. It carries 3.17x on the hidden
+  # states -- see the block below for why they take the same value.
+  centered_cosine_floor: 0.99
+  # DOTTED KEYS, and they reach the grader through `native_extras` ->
+  # `_surface_band` rather than through `_band()`. All three are declared
+  # because an absent one silently grades at the tier value
+  # (checked by the harness's per-instance symmetry test).
+  #
+  # NO `centered_cosine_floor.hidden_states` OVERRIDE, and that absence is a
+  # MEASUREMENT rather than an omission -- which is the one thing an absent
+  # threshold key is normally not, so it is argued here.
+  #
+  # Five instances declare that override and all five do it to LOOSEN a hidden
+  # surface that is an order of magnitude worse than their logits. This
+  # instance's two surfaces are within 1.7x of each other:
+  #
+  #     logits   `_assert_logit_parity`  0.9946502447   (1 - cos  5.350e-03)
+  #     hidden   hidden_35               0.9968481064   (1 - cos  3.152e-03)
+  #
+  # so the tier value set by the worse of the two carries 1.87x on the logits
+  # and 3.17x on the hidden states, and a second key would be splitting a
+  # difference that is not there.
+  #
+  # NO 0.998 HIDDEN OVERRIDE is declared, and the reason is worth recording
+  # because it is a property of the INSTRUMENT and will recur. The pytest plugin
+  # reports the hidden minimum only over the layers a check actually reaches. If
+  # `abs_tol.hidden_states` is left at 1.0, `_assert_array_parity` raises at
+  # hidden_35 (floor 1.04688) BEFORE `test_hidden_states` reaches the
+  # `centered >= floor` line for that layer, so the recorded minimum covers
+  # layers 0..34 only (0.9994571209 at hidden_12) and misses hidden_35, whose
+  # true value is 0.9968481064. Re-measure after loosening an earlier clause in
+  # the same check.
+  abs_tol.kv_cache_state: 0.5        # floor 0.272391 (cache_group0) -- 1.84x
+  # RAISED FROM 1.0, which the first oracle grade failed: the floor is 1.04688
+  # at hidden_35, the post-final-norm row. 2.0 carries 1.91x. `_shallow_abs_cap`
+  # rescales this by the reference's own running peak at each depth, so what
+  # grades the shallow layers is a fraction of it and not the declared value.
+  abs_tol.hidden_states: 2.0
+
+seed: 42
+
+# --------------------------------------------------------------------------- #
+# Geometry. TWO CONSTRAINTS THAT ARE NOT ANY OTHER INSTANCE'S.
+# --------------------------------------------------------------------------- #
+# 1. `max_model_len` IS 544 AND NOT ~160, AND THE REASON IS THE SLIDING WINDOW.
+#
+# `sliding_window` is 512 on this checkpoint (four times `core_gpt_oss`'s 128),
+# and 28 of the 35 layers use it. A probe that never reaches 512 tokens makes
+# every sliding layer behave EXACTLY like a full one, so "window every sliding
+# layer" and "window no layer" both grade green -- the same hole `core_gpt_oss`
+# raised its prompt to 135 to close.
+#
+# CLOSING IT WITH THE MAIN PROBE WAS PRICED AND REJECTED. At prompt_len 520 the
+# frozen logits alone are 520 x 262144 x 4 B = 545 MB, and the golden tree comes
+# out near 1.6 GB against `core_gpt_oss`'s measured 424 MB -- the largest in the
+# class by 3.8x, on the family that already has the largest reference. So the
+# window is crossed on the L6 HELD-OUT path instead, which freezes per-token
+# log-probs and not logits: one 520-token entry in tests/held_out_prompts.yaml
+# costs ~2 KB of golden and puts 512 genuinely-clipped positions through 28
+# sliding layers on a graded check. `max_model_len` exists to admit that entry.
+#
+# WHAT IT COSTS THE MAIN PROBE, stated because it is not free: `pages_per_seq`
+# must reach `max_model_len / page_size` = 17, and `paged_attention` gathers
+# `pages_per_seq * page_size` = 544 KV positions for every query token whatever
+# the sequence length. On this family that gather is cheap -- `num_kv_heads` is
+# 1, so `jnp.repeat(keys, 8, axis=2)` is a broadcast rather than a
+# materialisation, and the [124, 544, 1, 512] fp32 intermediate on a full layer
+# is 138 MB transient. `core_gpt_oss`, with 8 KV heads, materialises 424 MB at a
+# third of the width.
+#
+# 2. THE LAST DECODE STEP OPENS A PAGE THE PROMPT NEVER REACHED. prompt_len 124
+# spans ceil(124/32) = 4 pages; the run reaches 124 + 8 = 132 and spans 5. That
+# is what makes `generate`'s final decode_step observable in the frozen cache
+# (`engine.generate` says why the last step's logits are discarded but its WRITE
+# is not), and it is why prompt_len is 124 rather than the 128 that would sit
+# exactly on the boundary.
+#
+# RunConfig.__post_init__ requires pages_per_seq * page_size >= max_model_len
+# (17 * 32 = 544 >= 544) and num_pages >= max_num_seqs * pages_per_seq (20 >= 17).
+page_size: 32
+num_pages: 20
+max_num_seqs: 1
+pages_per_seq: 17
+max_model_len: 544
+
+# NON-IDENTITY EVERYWHERE, and validate_geometry refuses anything else: over a
+# page where page_ids[i] == i the slot equals the position, so a candidate that
+# ignored block_tables and indexed the cache flat would reproduce
+# kv_cache_state.npz exactly. Five ids because the run spans
+# ceil((124 + 8) / 32) = 5 pages.
+#
+# `num_pages` IS 20 RATHER THAN THE 17 pages_per_seq FORCES, so the
+# paging-invariance probe's two maps are genuinely disjoint: `_t2j.candidate`
+# derives the default `[0, 1, 2, 3, 4]` and the permuted `[19, 18, 17, 16, 15]`
+# from `num_pages`, and at num_pages 17 they would still be disjoint -- 20
+# leaves three spare on top, which is the headroom the allocator probes use.
+page_ids: [3, 0, 5, 1, 7]
+
+# The K sweep. FOUR legs -- three fitting
+# points once `fit_step_time` drops call 1, the minimum at which it has a degree
+# of freedom to see a bad call in. `num_decode_steps` (8) MUST be one of these
+# four: `perf_probe` samples `tokens` -- the work gate's subject -- only on that
+# leg, and the gate silently gets `None` if the coupling breaks.
+# Feasibility, this instance's own geometry: ceil((124 + 16) / 32) = 5 <= 17,
+# and 124 + 16 = 140 <= 544. The harness
+# enforces both, per instance.
+perf_k_values: [2, 4, 8, 16]
+
+prompt_len: 124
+num_decode_steps: 8
+
+# gemma-4's own SentencePiece-derived tokenizer, vocab 262144. Encoded with
+#   Tokenizer.from_file("google/gemma-4-E2B-it/tokenizer.json")
+#     .encode(text, add_special_tokens=False).ids
+# and `<bos>` (id 2) PREPENDED BY HAND, unlike core_gpt_oss's bare completion
+# prompt. That is not a style choice: gemma-4's tokenizer.json carries a
+# `TemplateProcessing` post-processor whose `special_tokens` table is EMPTY, so
+# `add_special_tokens=True` adds nothing and the tokenizer will never emit a BOS
+# of its own -- while `generation_config.json` declares `bos_token_id: 2` and
+# every gemma model is trained with it. A prompt without it is off-distribution
+# in a way that is invisible to every shape check.
+# The harness's BOS map carries the same `[2]` for the same reason.
+#
+# The text is a plain factual continuation, chosen so the greedy trajectory is
+# decisive enough for `test_greedy_sequence` to be a real comparison. MEASURED
+# on the reference at bf16: the 16-step greedy continuation is
+#   " cities like Paris, London, Rome, and many others."
+# at a mean step log-prob of -0.21, i.e. fluent and strongly determined.
+#
+#   "The capital of France is Paris, and the capital of Japan is Tokyo. Rivers
+#    shape the cities built beside them: the Seine divides Paris into a left
+#    bank and a right bank, the Thames runs east through London to the sea, and
+#    the Danube passes through four national capitals on its way from the Black
+#    Forest to the Black Sea. A river is also a boundary, a trade route, and a
+#    source of drinking water, which is why so many of the oldest settlements
+#    in Europe and Asia were founded on one. Bridges, ferries and embankments
+#    followed. The list of such river cities is long, and it begins with"
+prompt_token_ids: [2, 818, 5279, 529, 7001, 563, 9079, 236764, 532, 506, 5279,
+  529, 6056, 563, 21038, 236761, 36835, 6230, 506, 9979, 5284, 28383, 1091,
+  236787, 506, 69598, 59529, 9079, 1131, 496, 2378, 4856, 532, 496, 1447, 4856,
+  236764, 506, 77634, 8784, 13512, 1343, 5860, 531, 506, 5442, 236764, 532, 506,
+  99836, 16349, 1343, 2390, 4559, 115441, 580, 1061, 1595, 699, 506, 5561, 13988,
+  531, 506, 5561, 12991, 236761, 562, 8858, 563, 992, 496, 10134, 236764, 496,
+  5754, 9116, 236764, 532, 496, 3738, 529, 15403, 1813, 236764, 837, 563, 3217,
+  834, 1551, 529, 506, 24625, 53965, 528, 3879, 532, 11560, 964, 16311, 580, 886,
+  236761, 81689, 236764, 181140, 532, 120157, 1230, 6641, 236761, 669, 1694, 529,
+  1288, 8858, 9979, 563, 1440, 236764, 532, 625, 12502, 607]
+
+# --------------------------------------------------------------------------- #
+# Probe configuration. The class-wide grid, held fixed on purpose -- these are
+# per-CLASS choices, not per-family ones, and holding them fixed is what makes
+# the instances' measured bands comparable. Any point that had to move for this
+# checkpoint says so on its own line.
+# --------------------------------------------------------------------------- #
+#
+# ONE POINT MOVED, AND IT WAS MOVED BY MEASUREMENT ON THIS CHECKPOINT'S OWN
+# FROZEN ROW, NOT BY INSPECTION. Grid 4 is the "top-k AND top-p co-active" point
+# and the class-wide value for it is `{1.0, 50, 0.85}`. On this instance that
+# point is ORDER-BLIND: `test_the_sampler_grid_makes_chain_ORDER_observable`
+# failed with `t->p->k` moving ZERO cells at every one of the six points.
+#
+# THE CAUSE IS THIS CHECKPOINT'S DISTRIBUTION, and it is worth recording because
+# it is a property of the model rather than of the grid. gemma-4's frozen row is
+# FLAT next to the other families': top-1 probability 0.2878, and the whole
+# top-5 carries 0.9143. So `top_p 0.85` keeps FOUR tokens -- far inside
+# `top_k 50` -- and a top_p cut that never reaches the top_k boundary is
+# invariant under every permutation of the three transforms. `core_gpt_oss`'s
+# row keeps 267 tokens at the same p; the shared value was calibrated against
+# distributions like that one.
+#
+# THE REPLACEMENT WAS CHOSEN AGAINST ALL FOUR OF THIS CLASS'S SAMPLER CRITERIA
+# AT ONCE, over a 3 x 12 x 21 sweep of (temperature, top_k, top_p):
+#
+#   1. ORDER-OBSERVABLE. `{1.0, 12, 0.95}` moves 3 mask cells under `t->p->k`.
+#      (Grid 5 already carried `k->p->t` at 1 cell and still does.)
+#   2. NOT CUT INSIDE A TIE. The cumulative margin at the cut is 6.470e-03,
+#      which is 129x the 5.0e-05 floor. The obvious higher-yield alternatives
+#      are worse here and were rejected for it: `{1.0, 50, 0.99}` moves 32 cells
+#      at a margin of 4.26e-05, BELOW the floor, and `{1.0, 20, 0.99}` moves 6
+#      at 1.41e-04, only 2.8x it.
+#   3. NO bf16 RANK-ADJACENCY COLLISION at the boundary.
+#   4. NOT A DUPLICATE OF ANOTHER POINT. This is the criterion that eliminated
+#      the best-margin candidates: `{1.0, 8, 0.93}`, `{1.0, 8, 0.94}`,
+#      `{1.0, 8, 0.95}` and `{1.0, 10, 0.93}` all have margins above 1.5e-02 and
+#      all produce output BIT-IDENTICAL to grid 2 `{1.0, 0, 0.9}`, because at
+#      this row every one of them lands on the same top-5. Two grid points
+#      spending the budget on one computation is a defect
+#      (`test_no_two_sampler_grid_points_grade_the_same_thing`), so the winner
+#      has to keep a DIFFERENT count -- 6 rather than 5.
+#
+# The other five points are the class-wide grid unchanged, and all five were
+# re-checked against the same four criteria on this row rather than inherited.
+sampler_grid:
+  - {temperature: 1.0, top_k: 0, top_p: 1.0}
+  - {temperature: 0.7, top_k: 50, top_p: 1.0}
+  - {temperature: 1.0, top_k: 0, top_p: 0.9}
+  - {temperature: 0.0, top_k: 0, top_p: 1.0}
+  - {temperature: 1.0, top_k: 12, top_p: 0.95}  # order-observable; see above
+  - {temperature: 0.7, top_k: 0, top_p: 0.9}
+logprobs_top_n: 5
+
+# One JAX generation leg is a prefill plus eight decode steps over a 4.65 B
+# model whose forward carries a 2.35 B-parameter per-layer embedding table.
+generate_timeout_s: 3600
+
+compare_hidden_states: true
+
+# The graded denominator, observed from the oracle grading run.
+graded_checks: 33
+
+# Authoring-host paths. NOT mirrored into meta.json.
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden

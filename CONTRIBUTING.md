@@ -31,3 +31,17 @@ All submissions, including submissions by project members, require review. We
 use GitHub pull requests for this purpose. Consult
 [GitHub Help](https://help.github.com/articles/about-pull-requests/) for more
 information on using pull requests.
+### Local validation
+
+Use Python 3.12 with `pytest`, `numpy`, and `PyYAML` for the CPU-only tooling checks:
+
+```bash
+python -m pytest -q tools/tests
+bash -n run_eval.sh build_harbor_images.sh
+```
+
+Grader helper copies are vendored into tasks to keep each image self-contained. Apply
+shared changes consistently; training and inference have class-specific reducers and
+candidate adapters. Changes to scoring, task instructions, or reference implementations
+also require validation with the pinned environments, frozen references, and supported
+H100 hardware. CPU tooling tests do not establish benchmark equivalence.

@@ -1,0 +1,15 @@
+# Agent base image (training tasks): jax/flax/optax plus torch/transformers, so the agent
+# can run torch_orig as a reference. torch is allowed here; the verifier is torch-free.
+#   t2j-agent-base -> t2j-model:{model} -> t2j-agent:{method}-{model}
+# Build: base_image/build_base_images.sh --bases-only
+# grade.txt and authoring.txt go to one pip install so torch and jax get compatible CUDA wheels.
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/t2j
+COPY requirements/grade.txt requirements/authoring.txt /opt/t2j/requirements/
+RUN pip install --no-cache-dir -r requirements/grade.txt -r requirements/authoring.txt
+
+WORKDIR /workspace

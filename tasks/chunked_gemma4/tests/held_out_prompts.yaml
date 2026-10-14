@@ -1,0 +1,246 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The L6 held-out prompt set for chunked/gemma4.
+#
+# TRANSPLANTED BYTE-FOR-BYTE FROM `core_gemma4` EXCEPT THIS HEADER. The held-out
+# path is single-sequence on every mode -- `serve.py` builds one request, teacher-
+# forces one continuation and reads one set of per-token log-probs -- so nothing
+# in this file is a function of the mode. It is FAMILY data, and re-authoring it
+# would only move the numbers the freeze reproduces.
+#
+# AUTHORED, NOT SAMPLED, and that is defensible because this is a PARITY
+# measurement on identical inputs and not a quality benchmark: representativeness
+# buys nothing, axis coverage buys everything, and only authoring gives axis
+# coverage on demand. Nothing here is scored against a reference ANSWER --
+# the held-out freezer teacher-forces the supplied continuation through
+# `environment/torch_orig/serve.py` at fp32 and freezes the per-token log-probs,
+# and a candidate's JAX `serve.py` is asked for the same numbers on the same ids.
+#
+# THE HARD CONSTRAINT IS prompt_len + cont_len <= max_model_len = 544
+# (pages_per_seq 17 * page_size 32, from tests/instance.yaml).
+# `serve.get_serve_args`, `config.RunConfig.__post_init__` and `Engine._grow` all
+# enforce it, so a longer entry fails at FREEZE time and not at grade time.
+#
+# ===========================================================================
+# THE LAST ENTRY IS THE ONLY PLACE IN THIS INSTANCE'S GRADE WHERE THE SLIDING
+# WINDOW ACTUALLY CLIPS, AND IT IS HERE ON PURPOSE.
+# ===========================================================================
+# gemma-4-E2B's `sliding_window` is 512 and 28 of its 35 layers use it. The main
+# probe is 124 tokens, so on the canonical scenario every sliding layer sees its
+# whole sequence and behaves EXACTLY like a full-attention layer -- which means a
+# port that passed `sliding_window=None` everywhere would grade green on all of
+# it. `core_gpt_oss` closed the same hole by raising its main prompt over its own
+# 128-token window; at a 512-token window that costs 545 MB of frozen logits and
+# a golden tree near 1.6 GB, against `core_gpt_oss`'s measured 424 MB.
+#
+# This path is where it is cheap. L6 freezes per-token LOG-PROBS, not logits, so
+# the 520 + 6 entry below costs about 2 KB of `held_out.npz` and puts 512
+# genuinely-clipped query positions through all 28 sliding layers. It is the
+# reason `max_model_len` is 544 rather than the ~160 the main probe needs, and
+# tests/instance.yaml says so at the geometry block.
+#
+# NO CONTINUATION TOKEN MAY SCORE A LOG-PROB OF 0.0, and that is a hard
+# refusal in the freezer rather than a preference: the rows are
+# zero-PADDED to the longest continuation, so a real 0.0 inside a row is
+# indistinguishable from padding downstream. A continuation that saturates
+# can carry a token log-prob at exactly 0.0, which this refusal rejects. Every
+# continuation here has since been scored on the fp32 reference and the
+# worst single token across all sixteen rows is -8.900e-04; the five that
+# saturated were replaced rather than trimmed, because a shorter version of
+# a saturating continuation is still measuring nothing on the tokens it
+# keeps.
+#
+# IT IS ONE LONG ENTRY AND NOT SEVERAL, deliberately: the freezer teacher-forces
+# every entry through the fp32 TORCH reference on CPU, and a 528-token forward
+# over a 4.65 B model is by far the most expensive thing in this file.
+#
+# AXES, at page_size 32:
+#   prompt_len  3, 7, 8, 31, 32, 33, 63, 64, 65, 92, 520
+#               -- the one-before / exactly-on / one-after triples at BOTH page
+#               boundaries the short entries reach (31/32/33 and 63/64/65), a
+#               spread below the first boundary, and the window-crossing entry.
+#               An off-by-one in the slot mapping or in the block-table gather
+#               shows as a difference BETWEEN the members of a triple, not as a
+#               uniformly wrong number that a single length could not localise.
+#   cont_len    1, 2, 6, 7, 8, 9, 10, 12. 1 is the degenerate single-token
+#               case; 12 at prompt_len 92 carries the whole scored window
+#               ACROSS a page boundary the prompt did not reach (92 spans
+#               three pages, 104 spans four).
+#   entropy     every short bucket carries at least one strongly-determined
+#               continuation (marked `determined`) and at least one open-ended
+#               one (`open`), so the measurement is not taken entirely on
+#               near-deterministic tokens -- where a log-prob difference is small
+#               for reasons that have nothing to do with the port -- nor entirely
+#               on flat distributions, where it is large for the same reason.
+#
+# EVERY PROMPT STARTS WITH `<bos>` (id 2), unlike `core_gpt_oss`'s bare
+# completions. gemma-4's tokenizer.json has an EMPTY `special_tokens` table in
+# its TemplateProcessing post-processor, so `encode` never adds one, while
+# `generation_config.json` declares `bos_token_id: 2`. tests/instance.yaml's
+# `prompt_token_ids` carries the same leading 2 for the same reason.
+#
+# IDS, NOT TEXT, on the same rule tests/instance.yaml's `prompt_token_ids`
+# follows: THE FREEZER MUST NOT DEPEND ON A TOKENIZER. The `text` and `cont_text`
+# fields are comments for human readers and are NOT read by anything -- they were
+# encoded once, with
+# `Tokenizer.from_file("/data/google/gemma-4-E2B-it/tokenizer.json")` and
+# `add_special_tokens=False`. Editing one of them changes NOTHING; editing the
+# ids without re-freezing invalidates golden/held_out.npz.
+#
+# The `page-boundary N` and `sliding window` entries are SLICES of one long
+# passage's id list rather than authored sentences -- which is how their lengths
+# are exact. Their `text` is what the tokenizer decodes those ids back to.
+
+prompts:
+  # determined: 3 + 1
+  - text: 'The capital'
+    cont_text: ' of'
+    prompt_token_ids: [2, 818, 5279]
+    cont_token_ids: [529]
+  # determined: 3 + 6
+  - text: 'Water boils'
+    cont_text: ' sooner in a kettle than in'
+    prompt_token_ids: [2, 17390, 104264]
+    cont_token_ids: [32909, 528, 496, 71603, 1082, 528]
+  # open: 3 + 8
+  - text: 'She wondered'
+    cont_text: ' whether the letter would ever arrive at all'
+    prompt_token_ids: [2, 5778, 38757]
+    cont_token_ids: [3363, 506, 6064, 1093, 3785, 15074, 657, 784]
+  # open: 3 + 10
+  - text: 'Paris is'
+    cont_text: ' not the only capital on that river, though it'
+    prompt_token_ids: [2, 50429, 563]
+    cont_token_ids: [711, 506, 1186, 5279, 580, 600, 8858, 236764, 3635, 625]
+  # determined: 7 + 1
+  - text: 'The chemical symbol for gold is'
+    cont_text: ' Au'
+    prompt_token_ids: [2, 818, 7395, 5404, 573, 5122, 563]
+    cont_token_ids: [16107]
+  # determined: 7 + 6
+  - text: 'The boiling point of water is'
+    cont_text: ' lower on a mountain than at'
+    prompt_token_ids: [2, 818, 31476, 1523, 529, 1813, 563]
+    cont_token_ids: [3718, 580, 496, 10565, 1082, 657]
+  # open: 7 + 7
+  - text: 'She looked out of the window'
+    cont_text: ' and watched a slow grey rain begin'
+    prompt_token_ids: [2, 5778, 6976, 855, 529, 506, 4771]
+    cont_token_ids: [532, 19061, 496, 5111, 13501, 6927, 3654]
+  # open: 8 + 2
+  - text: 'He walked into the room and saw'
+    cont_text: ' a man'
+    prompt_token_ids: [2, 2209, 16393, 1131, 506, 2978, 532, 5004]
+    cont_token_ids: [496, 880]
+  # page-boundary 31: 31 + 9
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not romantic but practical: a river is drinking water'
+    cont_text: ', a road, a boundary and a source'
+    prompt_token_ids: [2, 194618, 735, 21735, 3246, 19960, 573, 618, 1440, 618, 993, 735, 1010, 53965, 657,
+      784, 236764, 532, 506, 3282, 563, 711, 21361, 840, 10231, 236787, 496, 8858, 563,
+      15403, 1813]
+    cont_token_ids: [236764, 496, 4284, 236764, 496, 10134, 532, 496, 3738]
+  # page-boundary 32: 32 + 9
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not romantic but practical: a river is drinking water,'
+    cont_text: ' a road, a boundary and a source of'
+    prompt_token_ids: [2, 194618, 735, 21735, 3246, 19960, 573, 618, 1440, 618, 993, 735, 1010, 53965, 657,
+      784, 236764, 532, 506, 3282, 563, 711, 21361, 840, 10231, 236787, 496, 8858, 563,
+      15403, 1813, 236764]
+    cont_token_ids: [496, 4284, 236764, 496, 10134, 532, 496, 3738, 529]
+  # page-boundary 33: 33 + 9
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not romantic but practical: a river is drinking water, a'
+    cont_text: ' road, a boundary and a source of power'
+    prompt_token_ids: [2, 194618, 735, 21735, 3246, 19960, 573, 618, 1440, 618, 993, 735, 1010, 53965, 657,
+      784, 236764, 532, 506, 3282, 563, 711, 21361, 840, 10231, 236787, 496, 8858, 563,
+      15403, 1813, 236764, 496]
+    cont_token_ids: [4284, 236764, 496, 10134, 532, 496, 3738, 529, 2066]
+  # page-boundary 63: 63 + 9
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not romantic but practical: a river is drinking water, a road, a boundary and a source of power, and for most of history a town that had one could do things a town that did not could never'
+    cont_text: ' do. The first cities of Mesopotamia grew where'
+    prompt_token_ids: [2, 194618, 735, 21735, 3246, 19960, 573, 618, 1440, 618, 993, 735, 1010, 53965, 657,
+      784, 236764, 532, 506, 3282, 563, 711, 21361, 840, 10231, 236787, 496, 8858, 563,
+      15403, 1813, 236764, 496, 4284, 236764, 496, 10134, 532, 496, 3738, 529, 2066, 236764,
+      532, 573, 1346, 529, 4083, 496, 5148, 600, 1053, 886, 1451, 776, 2432, 496, 5148, 600,
+      1602, 711, 1451, 2752]
+    cont_token_ids: [776, 236761, 669, 1171, 9979, 529, 197863, 13958, 1298]
+  # page-boundary 64: 64 + 9
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not romantic but practical: a river is drinking water, a road, a boundary and a source of power, and for most of history a town that had one could do things a town that did not could never do'
+    cont_text: '. The first cities of Mesopotamia grew where the'
+    prompt_token_ids: [2, 194618, 735, 21735, 3246, 19960, 573, 618, 1440, 618, 993, 735, 1010, 53965, 657,
+      784, 236764, 532, 506, 3282, 563, 711, 21361, 840, 10231, 236787, 496, 8858, 563,
+      15403, 1813, 236764, 496, 4284, 236764, 496, 10134, 532, 496, 3738, 529, 2066, 236764,
+      532, 573, 1346, 529, 4083, 496, 5148, 600, 1053, 886, 1451, 776, 2432, 496, 5148, 600,
+      1602, 711, 1451, 2752, 776]
+    cont_token_ids: [236761, 669, 1171, 9979, 529, 197863, 13958, 1298, 506]
+  # page-boundary 65: 65 + 9
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not romantic but practical: a river is drinking water, a road, a boundary and a source of power, and for most of history a town that had one could do things a town that did not could never do.'
+    cont_text: ' The first cities of Mesopotamia grew where the Tig'
+    prompt_token_ids: [2, 194618, 735, 21735, 3246, 19960, 573, 618, 1440, 618, 993, 735, 1010, 53965, 657,
+      784, 236764, 532, 506, 3282, 563, 711, 21361, 840, 10231, 236787, 496, 8858, 563,
+      15403, 1813, 236764, 496, 4284, 236764, 496, 10134, 532, 496, 3738, 529, 2066, 236764,
+      532, 573, 1346, 529, 4083, 496, 5148, 600, 1053, 886, 1451, 776, 2432, 496, 5148, 600,
+      1602, 711, 1451, 2752, 776, 236761]
+    cont_token_ids: [669, 1171, 9979, 529, 197863, 13958, 1298, 506, 35722]
+  # boundary-crossing continuation: 92 + 12 -- 92 spans 3 pages, 104 spans 4
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not romantic but practical: a river is drinking water, a road, a boundary and a source of power, and for most of history a town that had one could do things a town that did not could never do. The first cities of Mesopotamia grew where the Tigris and the Euphrates could be diverted into fields; the first cities of Egypt grew along'
+    cont_text: ' a single river whose flood was so regular that the calendar was'
+    prompt_token_ids: [2, 194618, 735, 21735, 3246, 19960, 573, 618, 1440, 618, 993, 735, 1010, 53965, 657,
+      784, 236764, 532, 506, 3282, 563, 711, 21361, 840, 10231, 236787, 496, 8858, 563,
+      15403, 1813, 236764, 496, 4284, 236764, 496, 10134, 532, 496, 3738, 529, 2066, 236764,
+      532, 573, 1346, 529, 4083, 496, 5148, 600, 1053, 886, 1451, 776, 2432, 496, 5148, 600,
+      1602, 711, 1451, 2752, 776, 236761, 669, 1171, 9979, 529, 197863, 13958, 1298, 506,
+      35722, 4499, 532, 506, 142639, 14473, 1451, 577, 90066, 1131, 6192, 236793, 506, 1171,
+      9979, 529, 13547, 13958, 3008]
+    cont_token_ids: [496, 3161, 8858, 5769, 18226, 691, 834, 4841, 600, 506, 14626, 691]
+  # sliding window: 520 + 6 -- crosses sliding_window=512
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not romantic but practical: a river is drinking water, a road, a boundary and a source of power, and for most of history a town that had one could do things a town that did not could never do. The first cities of Mesopotamia grew where the Tigris and the Euphrates could be diverted into fields; the first cities of Egypt grew along a single river whose flood was so regular that the calendar was built around it. In Europe the pattern repeats at a smaller scale. London sits at the lowest point where the Thames could be bridged and still be reached by seagoing ships, which is a very specific compromise and explains the shape of the city better than any plan does. Paris began on an island in the Seine because an island is defensible and a ford is valuable, and the two halves of the modern city are still called the left bank and the right bank after the water between them. Vienna, Budapest and Bratislava are all Danube towns, and Belgrade sits where the Sava joins it; the river carried grain downstream and salt upstream for centuries before any of them had a railway. Further east the pattern is the same but the distances are larger, and a single river can be the only reliable way to move anything at all for months of the year. What changes with industry is not that rivers stop mattering but that what they are for changes. A mill needs a fall of water; a factory needs cooling; a port needs depth, and depth is dredged rather than found. Embankments appear, then locks, then reservoirs upstream that hold the flood back so the city below can build on ground that used to be a floodplain. Each of these makes the river more useful and less like a river, and the eventual result is a waterway that is managed end to end and that nobody thinks of as wild. The costs of that arrive later and are mostly paid by people downstream, which is why river law is old, complicated and full of compromises between places that cannot see one another. A treaty about a river is a treaty about rainfall in somebody else''s mountains, and the further apart the two ends are the harder the bargain becomes. Modern water management inherits all of it: the old weirs, the old rights, the old assumption that the flow next year will look like the flow last year. That last assumption is the one that has begun to fail, and it is failing first in the basins where the margin was always thinnest and the number of parties to the bargain was'
+    cont_text: ' always largest, which is to'
+    prompt_token_ids: [2, 194618, 735, 21735, 3246, 19960, 573, 618, 1440, 618, 993, 735, 1010, 53965, 657,
+      784, 236764, 532, 506, 3282, 563, 711, 21361, 840, 10231, 236787, 496, 8858, 563,
+      15403, 1813, 236764, 496, 4284, 236764, 496, 10134, 532, 496, 3738, 529, 2066, 236764,
+      532, 573, 1346, 529, 4083, 496, 5148, 600, 1053, 886, 1451, 776, 2432, 496, 5148, 600,
+      1602, 711, 1451, 2752, 776, 236761, 669, 1171, 9979, 529, 197863, 13958, 1298, 506,
+      35722, 4499, 532, 506, 142639, 14473, 1451, 577, 90066, 1131, 6192, 236793, 506, 1171,
+      9979, 529, 13547, 13958, 3008, 496, 3161, 8858, 5769, 18226, 691, 834, 4841, 600, 506,
+      14626, 691, 5284, 2101, 625, 236761, 799, 3879, 506, 3759, 66618, 657, 496, 7100,
+      5559, 236761, 5860, 23378, 657, 506, 14723, 1523, 1298, 506, 77634, 1451, 577, 166462,
+      532, 2036, 577, 8452, 684, 636, 5377, 522, 19916, 236764, 837, 563, 496, 1401, 3530,
+      32963, 532, 15948, 506, 6230, 529, 506, 3207, 2480, 1082, 1027, 2731, 1677, 236761,
+      9079, 6074, 580, 614, 9884, 528, 506, 69598, 1547, 614, 9884, 563, 63412, 1253, 532,
+      496, 37812, 563, 12272, 236764, 532, 506, 1156, 61006, 529, 506, 4532, 3207, 659,
+      2036, 2760, 506, 2378, 4856, 532, 506, 1447, 4856, 1308, 506, 1813, 1534, 1091,
+      236761, 34493, 236764, 52178, 532, 100854, 659, 784, 99836, 21274, 236764, 532, 86221,
+      23378, 1298, 506, 134555, 36572, 625, 236793, 506, 8858, 7505, 11261, 33437, 532,
+      9551, 36325, 573, 24744, 1680, 1027, 529, 1091, 1053, 496, 21071, 236761, 9077, 13512,
+      506, 3759, 563, 506, 1638, 840, 506, 22086, 659, 6268, 236764, 532, 496, 3161, 8858,
+      740, 577, 506, 1186, 13451, 1595, 531, 2827, 4658, 657, 784, 573, 3794, 529, 506,
+      1051, 236761, 2900, 3731, 607, 3956, 563, 711, 600, 25971, 4721, 4217, 522, 840, 600,
+      1144, 901, 659, 573, 3731, 236761, 562, 2612, 3548, 496, 3798, 529, 1813, 236793, 496,
+      11879, 3548, 16204, 236793, 496, 2411, 3548, 8744, 236764, 532, 8744, 563, 180381,
+      4319, 1082, 1765, 236761, 4075, 15433, 1230, 3196, 236764, 1299, 41226, 236764, 1299,
+      69284, 36325, 600, 2768, 506, 18226, 1063, 834, 506, 3207, 3426, 740, 2016, 580, 3866,
+      600, 1456, 531, 577, 496, 187655, 236761, 7714, 529, 1239, 3590, 506, 8858, 919, 6684,
+      532, 2344, 1133, 496, 8858, 236764, 532, 506, 43157, 1354, 563, 496, 121533, 600, 563,
+      10542, 1345, 531, 1345, 532, 600, 24063, 20547, 529, 618, 6877, 236761, 669, 5384,
+      529, 600, 15074, 3209, 532, 659, 10723, 6382, 684, 1331, 33437, 236764, 837, 563,
+      3217, 8858, 2621, 563, 2255, 236764, 15381, 532, 2587, 529, 121912, 1534, 6666, 600,
+      3914, 1460, 886, 2264, 236761, 562, 52340, 1003, 496, 8858, 563, 496, 52340, 1003,
+      37494, 528, 19866, 1663, 236789, 236751, 13254, 236764, 532, 506, 3342, 6576, 506,
+      1156, 10842, 659, 506, 20038, 506, 54124, 6775, 236761, 13806, 1813, 3997, 134209,
+      784, 529, 625, 236787, 506, 2255, 692, 16516, 236764, 506, 2255, 5726, 236764, 506,
+      2255, 15661, 600, 506, 2727, 2148, 1051, 795, 1385, 1133, 506, 2727, 1774, 1051,
+      236761, 2981, 1774, 15661, 563, 506, 886, 600, 815, 22711, 531, 5121, 236764, 532,
+      625, 563, 26929, 1171, 528, 506, 102226, 1298, 506, 5416, 691, 2462, 541, 233785, 532,
+      506, 1548, 529, 7789, 531, 506, 54124, 691]
+    cont_token_ids: [2462, 7488, 236764, 837, 563, 531]

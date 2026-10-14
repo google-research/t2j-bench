@@ -1,0 +1,188 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The L6 held-out prompt set.
+#
+# AUTHORED, NOT SAMPLED, and that is defensible because this is a PARITY
+# measurement on identical inputs and not a quality benchmark:
+# representativeness buys nothing, axis coverage buys everything, and only
+# authoring gives axis coverage on demand. Nothing here is scored against a
+# reference ANSWER -- the held-out freezer teacher-forces the supplied
+# continuation through `environment/torch_orig/serve.py` at fp32 and freezes the
+# per-token log-probs, and a candidate's JAX `serve.py` is asked for the same
+# numbers on the same ids.
+#
+# THE HARD CONSTRAINT IS prompt_len + cont_len <= max_model_len = 32
+# (pages_per_seq 4 * page_size 8, from tests/instance.yaml).
+# `serve.get_serve_args`, `config.RunConfig.__post_init__` and `Engine._grow` all
+# enforce it, so a longer entry fails at FREEZE time and not at grade time. The
+# largest sum below is 23 + 8 = 31.
+#
+# AXES, at page_size 8:
+#   prompt_len  3, 7, 8, 9, 15, 16, 17, 23 -- straddles every page boundary from
+#               both sides, including the exact multiples 8 and 16. 7/8/9 and
+#               15/16/17 are the one-before / exactly-on / one-after triples: an
+#               off-by-one in the slot mapping or in the block-table gather shows
+#               as a difference between the members of a triple, not as a
+#               uniformly wrong number that a single length could not localise.
+#   cont_len    1, 4, 8, 12 (subject to the sum bound). 1 is the degenerate
+#               single-token case; 8 makes the continuation exactly one page wide;
+#               and at prompt_len 3 the 12-token continuation carries the whole
+#               scored window across a page boundary that the prompt did not
+#               reach.
+#   entropy     every prompt_len bucket carries at least one strongly-determined
+#               continuation (a factual completion, marked `determined` in the
+#               per-entry comment) and at least one open-ended one (`open`), so
+#               the measurement is not taken entirely on near-deterministic
+#               tokens -- where a log-prob difference is small for reasons that
+#               have nothing to do with the port -- nor entirely on flat
+#               distributions, where it is large for the same reason.
+#
+# IDS, NOT TEXT, on the same rule tests/instance.yaml's `prompt_token_ids`
+# follows: THE FREEZER MUST NOT DEPEND ON A TOKENIZER. The `text` and `cont_text`
+# fields are comments for human readers and are NOT read by anything -- they were
+# encoded once, with
+# `Tokenizer.from_file("/data/meta-llama/Llama-3.2-1B-Instruct/tokenizer.json")`
+# and `add_special_tokens=False`, with BOS (128000) prepended by hand exactly as
+# instance.yaml's prompt does. Editing one of them changes NOTHING; editing the
+# ids without re-freezing invalidates golden/held_out.npz.
+#
+# HAND-EDITABLE. This file and tests/instance.yaml are hand-maintained;
+# the rest of tests/ is generated.
+prompts:
+  # [ 0] prompt_len  3  cont_len  1  determined
+  - text: 'The capital'
+    cont_text: ' of'
+    prompt_token_ids: [128000, 791, 6864]
+    cont_token_ids: [315]
+  # [ 1] prompt_len  3  cont_len  4  determined
+  - text: 'Water boils'
+    cont_text: ' at 100 degrees'
+    prompt_token_ids: [128000, 29353, 90055]
+    cont_token_ids: [520, 220, 1041, 12628]
+  # [ 2] prompt_len  3  cont_len  8  open
+  - text: 'She wondered'
+    cont_text: ' whether the letter would ever arrive at all'
+    prompt_token_ids: [128000, 8100, 31156]
+    cont_token_ids: [3508, 279, 6661, 1053, 3596, 17782, 520, 682]
+  # [ 3] prompt_len  3  cont_len 12  open
+  - text: 'Paris is'
+    cont_text: ' a city that has been rebuilt and reimagined many times'
+    prompt_token_ids: [128000, 60704, 374]
+    cont_token_ids: [264, 3363, 430, 706, 1027, 60685, 323, 312, 29116, 1619, 1690, 3115]
+  # [ 4] prompt_len  7  cont_len  1  determined
+  - text: 'The chemical symbol for gold is'
+    cont_text: ' Au'
+    prompt_token_ids: [128000, 791, 11742, 7891, 369, 6761, 374]
+    cont_token_ids: [33150]
+  # [ 5] prompt_len  7  cont_len  4  determined
+  - text: 'The boiling point of water is'
+    cont_text: ' 100 degrees Celsius'
+    prompt_token_ids: [128000, 791, 50937, 1486, 315, 3090, 374]
+    cont_token_ids: [220, 1041, 12628, 62447]
+  # [ 6] prompt_len  7  cont_len  8  open
+  - text: 'She looked out of the window'
+    cont_text: ' and watched the rain come down over the'
+    prompt_token_ids: [128000, 8100, 7111, 704, 315, 279, 3321]
+    cont_token_ids: [323, 15746, 279, 11422, 2586, 1523, 927, 279]
+  # [ 7] prompt_len  8  cont_len  1  open
+  - text: 'He walked into the room and saw'
+    cont_text: ' a'
+    prompt_token_ids: [128000, 1548, 15203, 1139, 279, 3130, 323, 5602]
+    cont_token_ids: [264]
+  # [ 8] prompt_len  8  cont_len  4  determined
+  - text: 'Water is a compound made of two'
+    cont_text: ' hydrogen atoms and one'
+    prompt_token_ids: [128000, 29353, 374, 264, 24549, 1903, 315, 1403]
+    cont_token_ids: [35784, 33299, 323, 832]
+  # [ 9] prompt_len  8  cont_len  8  open
+  - text: 'He picked up the pen and slowly'
+    cont_text: ' wrote the first sentence of a letter he'
+    prompt_token_ids: [128000, 1548, 13061, 709, 279, 5869, 323, 14297]
+    cont_token_ids: [6267, 279, 1176, 11914, 315, 264, 6661, 568]
+  # [10] prompt_len  9  cont_len  1  determined
+  - text: 'The first president of the United States was'
+    cont_text: ' George'
+    prompt_token_ids: [128000, 791, 1176, 4872, 315, 279, 3723, 4273, 574]
+    cont_token_ids: [10058]
+  # [11] prompt_len  9  cont_len  4  determined
+  - text: 'The largest planet in our solar system is'
+    cont_text: ' Jupiter, the fifth'
+    prompt_token_ids: [128000, 791, 7928, 11841, 304, 1057, 13238, 1887, 374]
+    cont_token_ids: [50789, 11, 279, 18172]
+  # [12] prompt_len  9  cont_len  8  open
+  - text: 'The old man sat on the bench and'
+    cont_text: ' watched the rain come down over the empty'
+    prompt_token_ids: [128000, 791, 2362, 893, 7731, 389, 279, 13731, 323]
+    cont_token_ids: [15746, 279, 11422, 2586, 1523, 927, 279, 4384]
+  # [13] prompt_len 15  cont_len  1  open
+  - text: 'When the storm finally passed, the villagers came out of their houses and'
+    cont_text: ' began'
+    prompt_token_ids: [128000, 4599, 279, 13766, 5616, 5946, 11, 279, 61921, 3782, 704, 315, 872, 15316, 323]
+    cont_token_ids: [6137]
+  # [14] prompt_len 15  cont_len  4  determined
+  - text: 'In geometry, the interior angles of any triangle always add up to exactly'
+    cont_text: ' 180 degrees.'
+    prompt_token_ids: [128000, 644, 17484, 11, 279, 15135, 27030, 315, 904, 22217, 2744, 923, 709, 311, 7041]
+    cont_token_ids: [220, 5245, 12628, 13]
+  # [15] prompt_len 15  cont_len  8  open
+  - text: 'The rain had stopped, and the street outside was quiet except for the'
+    cont_text: ' sound of water dripping from the gutters'
+    prompt_token_ids: [128000, 791, 11422, 1047, 10717, 11, 323, 279, 8761, 4994, 574, 11594, 3734, 369, 279]
+    cont_token_ids: [5222, 315, 3090, 77315, 505, 279, 18340, 5153]
+  # [16] prompt_len 16  cont_len  1  determined
+  - text: 'The Declaration of Independence was signed in seventeen seventy six by the United States of'
+    cont_text: ' America'
+    prompt_token_ids: [128000, 791, 42021, 315, 44177, 574, 8667, 304, 82497, 71049, 4848, 555, 279, 3723, 4273, 315]
+    cont_token_ids: [5270]
+  # [17] prompt_len 16  cont_len  4  determined
+  - text: 'In computer science, a hash table stores key value pairs and supports lookup in'
+    cont_text: ' constant time on average'
+    prompt_token_ids: [128000, 644, 6500, 8198, 11, 264, 5286, 2007, 10756, 1401, 907, 13840, 323, 11815, 19128, 304]
+    cont_token_ids: [6926, 892, 389, 5578]
+  # [18] prompt_len 16  cont_len  8  open
+  - text: 'The letter had been sitting on the hall table for three days before anyone thought'
+    cont_text: ' to open it, and by then the'
+    prompt_token_ids: [128000, 791, 6661, 1047, 1027, 11961, 389, 279, 14321, 2007, 369, 2380, 2919, 1603, 5606, 3463]
+    cont_token_ids: [311, 1825, 433, 11, 323, 555, 1243, 279]
+  # [19] prompt_len 17  cont_len  1  open
+  - text: 'The Great Wall of China was built over many centuries by successive dynasties to'
+    cont_text: ' keep'
+    prompt_token_ids: [128000, 791, 8681, 9935, 315, 5734, 574, 5918, 927, 1690, 24552, 555, 50024, 32170, 561, 552, 311]
+    cont_token_ids: [2567]
+  # [20] prompt_len 17  cont_len  4  determined
+  - text: 'The Amazon rainforest spans nine countries in South America and produces a large share of'
+    cont_text: " the world's oxygen"
+    prompt_token_ids: [128000, 791, 8339, 11422, 51755, 45395, 11888, 5961, 304, 4987, 5270, 323, 19159, 264, 3544, 4430, 315]
+    cont_token_ids: [279, 1917, 596, 24463]
+  # [21] prompt_len 17  cont_len  8  open
+  - text: 'The library had been closed for years, and when they finally opened the doors again'
+    cont_text: ' the room smelled of dust and old paper'
+    prompt_token_ids: [128000, 791, 6875, 1047, 1027, 8036, 369, 1667, 11, 323, 994, 814, 5616, 9107, 279, 14365, 1578]
+    cont_token_ids: [279, 3130, 86798, 315, 16174, 323, 2362, 5684]
+  # [22] prompt_len 23  cont_len  1  determined
+  - text: 'The periodic table arranges the chemical elements by increasing atomic number, and the element with atomic number one is called'
+    cont_text: ' hydrogen'
+    prompt_token_ids: [128000, 791, 39445, 2007, 2961, 5637, 279, 11742, 5540, 555, 7859, 25524, 1396, 11, 323, 279, 2449, 449, 25524, 1396, 832, 374, 2663]
+    cont_token_ids: [35784]
+  # [23] prompt_len 23  cont_len  4  determined
+  - text: 'The theory of general relativity, published by Albert Einstein in nineteen fifteen, describes gravity not as a force but'
+    cont_text: ' as a curvature of'
+    prompt_token_ids: [128000, 791, 10334, 315, 4689, 1375, 44515, 11, 4756, 555, 17971, 55152, 304, 94935, 37755, 11, 16964, 24128, 539, 439, 264, 5457, 719]
+    cont_token_ids: [439, 264, 83233, 315]
+  # [24] prompt_len 23  cont_len  8  open
+  - text: 'After the harvest was in and the barns were full, the family sat down at the long wooden table and'
+    cont_text: ' talked until the candles had burned right down'
+    prompt_token_ids: [128000, 6153, 279, 24322, 574, 304, 323, 279, 33419, 82, 1051, 2539, 11, 279, 3070, 7731, 1523, 520, 279, 1317, 23162, 2007, 323]
+    cont_token_ids: [15243, 3156, 279, 52305, 1047, 27724, 1314, 1523]

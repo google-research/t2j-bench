@@ -1,0 +1,231 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The L6 held-out prompt set for core/gpt_oss.
+#
+# AUTHORED, NOT SAMPLED, and that is defensible because this is a PARITY
+# measurement on identical inputs and not a quality benchmark: representativeness
+# buys nothing, axis coverage buys everything, and only authoring gives axis
+# coverage on demand. Nothing here is scored against a reference ANSWER --
+# the freezer teacher-forces the supplied continuation through
+# `environment/torch_orig/serve.py` at fp32 and freezes the per-token log-probs,
+# and a candidate's JAX `serve.py` is asked for the same numbers on the same ids.
+#
+# THE HARD CONSTRAINT IS prompt_len + cont_len <= max_model_len = 160
+# (pages_per_seq 5 * page_size 32, from tests/instance.yaml).
+# `serve.get_serve_args`, `config.RunConfig.__post_init__` and `Engine._grow` all
+# enforce it, so a longer entry fails at FREEZE time and not at grade time. The
+# largest sum below is 77 (page-boundary 65).
+#
+# AXES, at page_size 32:
+#   prompt_len  2, 6, 7, 20, 21, 22, 23, 31, 32, 33, 34, 35, 39, 43, 63, 64, 65
+#               -- the one-before / exactly-on / one-after triples at BOTH page
+#               boundaries the run can reach (31/32/33 and 63/64/65), plus a
+#               spread of short lengths below the first boundary. An off-by-one
+#               in the slot mapping or in the block-table gather shows as a
+#               difference BETWEEN the members of a triple, not as a uniformly
+#               wrong number that a single length could not localise.
+#   cont_len    1, 2, 4, 5, 8, 9, 12. 1 is the degenerate single-token case; 12 at
+#               prompt_len 65 carries the whole scored window across a boundary
+#               the prompt did not reach.
+#   entropy     every prompt_len bucket carries at least one strongly-determined
+#               continuation (marked `determined` in the per-entry comment) and
+#               at least one open-ended one (`open`), so the measurement is not
+#               taken entirely on near-deterministic tokens -- where a log-prob
+#               difference is small for reasons that have nothing to do with the
+#               port -- nor entirely on flat distributions, where it is large for
+#               the same reason.
+#
+# DELIBERATELY SHORTER THAN THE INSTANCE PROMPT, and it is worth being explicit
+# because instance.yaml goes to great lengths to exceed `sliding_window`. That is
+# the right choice THERE and the wrong one here: L6 measures the log-prob band
+# over many independent prompts, the sliding window is already exercised by every
+# other tier on the 135-token probe, and 25 prompts at 135 tokens would multiply
+# the freeze -- which runs on CPU against a 20.9B model -- by an order of
+# magnitude for coverage the suite already has.
+#
+# IDS, NOT TEXT, on the same rule tests/instance.yaml's `prompt_token_ids`
+# follows: THE FREEZER MUST NOT DEPEND ON A TOKENIZER. The `text` and `cont_text`
+# fields are comments for human readers and are NOT read by anything -- they were
+# encoded once, with
+# `Tokenizer.from_file("/data/openai/gpt-oss-20b/tokenizer.json")` and
+# `add_special_tokens=False`, and with NO bos prepended (gpt-oss's special tokens
+# are the harmony chat frame; these are bare completions, exactly like
+# instance.yaml's prompt). Editing one of them changes NOTHING; editing the ids
+# without re-freezing invalidates golden/held_out.npz.
+#
+# The six `page-boundary N` entries are SLICES of one long passage's id list
+# rather than authored sentences -- which is how their lengths are exact. Their
+# `text` is what the tokenizer decodes those ids back to.
+
+prompts:
+  # determined: 2 + 1 tokens
+  - text: 'The capital'
+    cont_text: ' of'
+    prompt_token_ids: [976, 9029]
+    cont_token_ids: [328]
+  # determined: 2 + 4 tokens
+  - text: 'Water boils'
+    cont_text: ' at 100 degrees'
+    prompt_token_ids: [27874, 165683]
+    cont_token_ids: [540, 220, 1353, 18210]
+  # open: 2 + 8 tokens
+  - text: 'She wondered'
+    cont_text: ' whether the letter would ever arrive at all'
+    prompt_token_ids: [13684, 50918]
+    cont_token_ids: [5588, 290, 10263, 1481, 4862, 18338, 540, 722]
+  # open: 2 + 12 tokens
+  - text: 'Paris is'
+    cont_text: ' a city that has been rebuilt and reimagined many times'
+    prompt_token_ids: [72782, 382]
+    cont_token_ids: [261, 5030, 484, 853, 1339, 106127, 326, 322, 66716, 2530, 1991, 4238]
+  # determined: 6 + 1 tokens
+  - text: 'The chemical symbol for gold is'
+    cont_text: ' Au'
+    prompt_token_ids: [976, 15377, 10038, 395, 8568, 382]
+    cont_token_ids: [18016]
+  # determined: 6 + 4 tokens
+  - text: 'The boiling point of water is'
+    cont_text: ' 100 degrees Celsius'
+    prompt_token_ids: [976, 79667, 2438, 328, 3411, 382]
+    cont_token_ids: [220, 1353, 18210, 93235]
+  # open: 6 + 8 tokens
+  - text: 'She looked out of the window'
+    cont_text: ' and watched the rain come down over the'
+    prompt_token_ids: [13684, 10802, 842, 328, 290, 5734]
+    cont_token_ids: [326, 25301, 290, 13873, 3063, 1917, 1072, 290]
+  # open: 7 + 1 tokens
+  - text: 'He walked into the room and saw'
+    cont_text: ' a'
+    prompt_token_ids: [2066, 23272, 1511, 290, 3435, 326, 8274]
+    cont_token_ids: [261]
+  # determined: 21 + 1 tokens
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is'
+    cont_text: ' simple'
+    prompt_token_ids: [49, 1973, 679, 40123, 5396, 34612, 395, 472, 1701, 472, 1354, 679, 1339, 95652, 540,
+      722, 11, 326, 290, 5207, 382]
+    cont_token_ids: [4705]
+  # open: 22 + 9 tokens
+  - text: 'Rivers have shaped human settlement for as long as there have been settlements at all, and the reason is not'
+    cont_text: ' hard to see: water is heavy and boats'
+    prompt_token_ids: [49, 1973, 679, 40123, 5396, 34612, 395, 472, 1701, 472, 1354, 679, 1339, 95652, 540,
+      722, 11, 326, 290, 5207, 382, 625]
+    cont_token_ids: [3479, 316, 1921, 25, 3411, 382, 12914, 326, 48347]
+  # determined: 20 + 1 tokens
+  - text: 'The three primary colours of light are red, green and blue; mixing all three in equal measure produces'
+    cont_text: ' white'
+    prompt_token_ids: [976, 3407, 9107, 31764, 328, 4207, 553, 3592, 11, 8851, 326, 9861, 26, 38917, 722,
+      3407, 306, 12629, 9714, 28135]
+    cont_token_ids: [6461]
+  # determined: 22 + 2 tokens
+  - text: 'A bridge carries a road or a railway across an obstacle, and the oldest surviving examples in Europe were built by'
+    cont_text: ' the Romans'
+    prompt_token_ids: [32, 23273, 39046, 261, 8733, 503, 261, 59602, 5251, 448, 57212, 11, 326, 290, 34331,
+      74933, 15652, 306, 6267, 1504, 8113, 656]
+    cont_token_ids: [290, 75657]
+  # open: 23 + 5 tokens
+  - text: 'When the tide went out that evening the whole harbour was left as a flat grey plain of mud, and the boats'
+    cont_text: ' leaned over on their sides'
+    prompt_token_ids: [5958, 290, 69214, 5981, 842, 484, 14456, 290, 6062, 118150, 673, 3561, 472, 261,
+      12508, 32588, 21402, 328, 13787, 11, 326, 290, 48347]
+    cont_token_ids: [118437, 1072, 402, 1043, 18089]
+  # determined: 21 + 1 tokens
+  - text: 'The Seine divides Paris into a left bank and a right bank; the left bank is the one to the'
+    cont_text: ' south'
+    prompt_token_ids: [976, 74722, 144028, 12650, 1511, 261, 3561, 6922, 326, 261, 1849, 6922, 26, 290,
+      3561, 6922, 382, 290, 1001, 316, 290]
+    cont_token_ids: [15019]
+  # determined: 34 + 2 tokens
+  - text: 'The Danube rises in the Black Forest and reaches the Black Sea, passing through four national capitals on the way. It is the second longest river in Europe, after the'
+    cont_text: ' Volga'
+    prompt_token_ids: [976, 8156, 4502, 67628, 306, 290, 7613, 29632, 326, 42373, 290, 7613, 22114, 11,
+      21178, 1819, 4242, 7769, 173420, 402, 290, 2006, 13, 1225, 382, 290, 3099, 37511,
+      20608, 306, 6267, 11, 1934, 290]
+    cont_token_ids: [9069, 2225]
+  # determined: 35 + 2 tokens
+  - text: 'Water is a compound of two hydrogen atoms and one oxygen atom. At sea level it freezes at zero degrees Celsius and boils at one hundred, which is the definition the scale was'
+    cont_text: ' built around'
+    prompt_token_ids: [27874, 382, 261, 36762, 328, 1920, 47612, 63489, 326, 1001, 34398, 34376, 13, 3604,
+      9624, 3211, 480, 178077, 540, 12421, 18210, 93235, 326, 165683, 540, 1001, 11779,
+      11, 1118, 382, 290, 16083, 290, 9318, 673]
+    cont_token_ids: [8113, 2846]
+  # open: 33 + 4 tokens
+  - text: 'He picked up the pen and slowly wrote the first sentence of a letter he had been putting off for months, and then he stopped, read it back, and crossed'
+    cont_text: ' the whole thing out'
+    prompt_token_ids: [2066, 19148, 869, 290, 6022, 326, 22936, 11955, 290, 1577, 21872, 328, 261, 10263,
+      501, 1458, 1339, 16019, 1277, 395, 5503, 11, 326, 1815, 501, 18145, 11, 1729, 480,
+      1602, 11, 326, 47928]
+    cont_token_ids: [290, 6062, 4435, 842]
+  # determined: 39 + 1 tokens
+  - text: 'A trade route is a boundary as much as it is a road: goods move along it, and so do languages, coins and diseases, which is why the oldest cities in the world sit on'
+    cont_text: ' rivers'
+    prompt_token_ids: [32, 10552, 9656, 382, 261, 35021, 472, 2009, 472, 480, 382, 261, 8733, 25, 14854,
+      5275, 4251, 480, 11, 326, 813, 621, 22772, 11, 28969, 326, 24889, 11, 1118, 382,
+      4436, 290, 34331, 15636, 306, 290, 2375, 2353, 402]
+    cont_token_ids: [54935]
+  # open: 43 + 1 tokens
+  - text: 'The list of great river cities is long and it is not settled: everyone agrees about Paris, London and Vienna, argues about Rome, and forgets entirely about the ones that mattered most when the goods still moved by'
+    cont_text: ' water'
+    prompt_token_ids: [976, 1562, 328, 2212, 20608, 15636, 382, 1701, 326, 480, 382, 625, 37724, 25, 6524,
+      64454, 1078, 12650, 11, 9741, 326, 70502, 11, 64923, 1078, 27388, 11, 326, 13814,
+      82, 19449, 1078, 290, 8104, 484, 184459, 1645, 1261, 290, 14854, 2928, 12183, 656]
+    cont_token_ids: [3411]
+  # page-boundary 31: 31 + 1 tokens
+  - text: 'Embankments, ferries and bridges all followed the same logic. A city on a river needs to cross it, needs to load and unload beside it'
+    cont_text: ','
+    prompt_token_ids: [2585, 17289, 1626, 11, 37316, 566, 326, 64592, 722, 12661, 290, 2684, 18485, 13,
+      355, 5030, 402, 261, 20608, 4414, 316, 8088, 480, 11, 4414, 316, 4700, 326, 108010,
+      49662, 480]
+    cont_token_ids: [11]
+  # page-boundary 32: 32 + 4 tokens
+  - text: 'Embankments, ferries and bridges all followed the same logic. A city on a river needs to cross it, needs to load and unload beside it,'
+    cont_text: ' and needs to stop'
+    prompt_token_ids: [2585, 17289, 1626, 11, 37316, 566, 326, 64592, 722, 12661, 290, 2684, 18485, 13,
+      355, 5030, 402, 261, 20608, 4414, 316, 8088, 480, 11, 4414, 316, 4700, 326, 108010,
+      49662, 480, 11]
+    cont_token_ids: [326, 4414, 316, 5666]
+  # page-boundary 33: 33 + 8 tokens
+  - text: 'Embankments, ferries and bridges all followed the same logic. A city on a river needs to cross it, needs to load and unload beside it, and'
+    cont_text: ' needs to stop it flooding the streets in'
+    prompt_token_ids: [2585, 17289, 1626, 11, 37316, 566, 326, 64592, 722, 12661, 290, 2684, 18485, 13,
+      355, 5030, 402, 261, 20608, 4414, 316, 8088, 480, 11, 4414, 316, 4700, 326, 108010,
+      49662, 480, 11, 326]
+    cont_token_ids: [4414, 316, 5666, 480, 66134, 290, 25360, 306]
+  # page-boundary 63: 63 + 1 tokens
+  - text: 'Embankments, ferries and bridges all followed the same logic. A city on a river needs to cross it, needs to load and unload beside it, and needs to stop it flooding the streets in spring. The order in which those three problems get solved says a great deal about when the city was built,'
+    cont_text: ' and'
+    prompt_token_ids: [2585, 17289, 1626, 11, 37316, 566, 326, 64592, 722, 12661, 290, 2684, 18485, 13,
+      355, 5030, 402, 261, 20608, 4414, 316, 8088, 480, 11, 4414, 316, 4700, 326, 108010,
+      49662, 480, 11, 326, 4414, 316, 5666, 480, 66134, 290, 25360, 306, 12860, 13, 623,
+      2569, 306, 1118, 2617, 3407, 6840, 717, 47244, 5003, 261, 2212, 4828, 1078, 1261,
+      290, 5030, 673, 8113, 11]
+    cont_token_ids: [326]
+  # page-boundary 64: 64 + 4 tokens
+  - text: 'Embankments, ferries and bridges all followed the same logic. A city on a river needs to cross it, needs to load and unload beside it, and needs to stop it flooding the streets in spring. The order in which those three problems get solved says a great deal about when the city was built, and'
+    cont_text: ' about how much money'
+    prompt_token_ids: [2585, 17289, 1626, 11, 37316, 566, 326, 64592, 722, 12661, 290, 2684, 18485, 13,
+      355, 5030, 402, 261, 20608, 4414, 316, 8088, 480, 11, 4414, 316, 4700, 326, 108010,
+      49662, 480, 11, 326, 4414, 316, 5666, 480, 66134, 290, 25360, 306, 12860, 13, 623,
+      2569, 306, 1118, 2617, 3407, 6840, 717, 47244, 5003, 261, 2212, 4828, 1078, 1261,
+      290, 5030, 673, 8113, 11, 326]
+    cont_token_ids: [1078, 1495, 2009, 3905]
+  # page-boundary 65: 65 + 12 tokens
+  - text: 'Embankments, ferries and bridges all followed the same logic. A city on a river needs to cross it, needs to load and unload beside it, and needs to stop it flooding the streets in spring. The order in which those three problems get solved says a great deal about when the city was built, and about'
+    cont_text: ' how much money it had at the time, and about whether'
+    prompt_token_ids: [2585, 17289, 1626, 11, 37316, 566, 326, 64592, 722, 12661, 290, 2684, 18485, 13,
+      355, 5030, 402, 261, 20608, 4414, 316, 8088, 480, 11, 4414, 316, 4700, 326, 108010,
+      49662, 480, 11, 326, 4414, 316, 5666, 480, 66134, 290, 25360, 306, 12860, 13, 623,
+      2569, 306, 1118, 2617, 3407, 6840, 717, 47244, 5003, 261, 2212, 4828, 1078, 1261,
+      290, 5030, 673, 8113, 11, 326, 1078]
+    cont_token_ids: [1495, 2009, 3905, 480, 1458, 540, 290, 1058, 11, 326, 1078, 5588]

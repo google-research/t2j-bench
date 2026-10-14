@@ -1,0 +1,24 @@
+# Agent base image (inference tasks): the inference grade env plus torch, so the agent can
+# run torch_orig as a reference. Built on the verifier base so both sides share the same
+# jax/flax/numpy install.
+#   t2j-inference-agent-base -> t2j-inference-agent:{mode}-{model}
+# Build: base_image/build_inference_bases.sh   (builds the verifier base first)
+FROM t2j-inference-verifier-base
+
+# git: for the agent to inspect references while working.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/t2j
+COPY requirements/inference-grade.txt requirements/inference-agent.txt /opt/t2j/requirements/
+# Listing inference-grade.txt again keeps torch from moving the jax/flax/numpy pins.
+RUN pip install --no-cache-dir -r requirements/inference-grade.txt -r requirements/inference-agent.txt
+
+# Match the grader's numerics so the agent's own comparisons against torch_orig are
+# meaningful (without these, a correct fp32 port can differ by ~5e-2). The verifier sets
+# them in tests/conftest.py and tests/test.sh instead. Downstream images must not
+# reassign XLA_FLAGS.
+ENV JAX_DEFAULT_MATMUL_PRECISION=highest
+ENV XLA_FLAGS=--xla_gpu_autotune_level=0
+
+WORKDIR /workspace

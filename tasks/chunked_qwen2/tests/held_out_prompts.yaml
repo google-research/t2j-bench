@@ -1,0 +1,214 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The L6 held-out prompt set.
+#
+# AUTHORED, NOT SAMPLED, and that is defensible because this is a PARITY
+# measurement on identical inputs and not a quality benchmark:
+# representativeness buys nothing, axis coverage buys everything, and only
+# authoring gives axis coverage on demand. Nothing here is scored against a
+# reference ANSWER -- the freezer teacher-forces the supplied
+# continuation through `environment/torch_orig/serve.py` at fp32 and freezes the
+# per-token log-probs, and a candidate's JAX `serve.py` is asked for the same
+# numbers on the same ids.
+#
+# THE TEXT IS core_llama3's, VERBATIM AND DELIBERATELY. This instance is the
+# family-axis control, so the 25 sentences are not re-authored for Qwen2: an L6
+# number is only comparable across families if the families were asked the same
+# question. What IS re-authored is every token id, because Qwen2.5's tokenizer is
+# a different tokenizer (vocab 151936 against llama3's 128256) and prepends no
+# BOS at all -- its `bos_token_id` is None, so unlike core_llama3's file there is
+# no special token prepended by hand to any row here.
+#
+# THE HARD CONSTRAINT IS prompt_len + cont_len <= max_model_len = 32
+# (pages_per_seq 4 * page_size 8, from tests/instance.yaml).
+# `serve.get_serve_args`, `config.RunConfig.__post_init__` and `Engine._grow` all
+# enforce it, so a longer entry fails at FREEZE time and not at grade time. The
+# largest sum below is 22 + 8 = 30.
+#
+# AXES UNDER THIS TOKENIZER, at page_size 8. These numbers are this tokenizer's,
+# not core_llama3's, and they are NOT the same numbers -- retokenizing
+# fixed text with a different tokenizer moves the lengths, and pretending
+# otherwise would describe a coverage the file does not have:
+#   prompt_len  2, 6, 7, 8, 14, 15, 16, 22   (core_llama3: 3, 7, 8, 9, 15, 16,
+#               17, 23 -- uniformly one higher, which is exactly its hand-
+#               prepended BOS and nothing else; the sentences tokenize to the
+#               same lengths in both vocabularies).
+#   cont_len    1, 4, 6, 8, 12 at counts 8, 5, 3, 8, 1 (core_llama3: 1, 4, 8, 12
+#               at 8, 8, 8, 1). Three rows whose continuation is 4 llama3 tokens
+#               are 6 Qwen2 tokens: this tokenizer splits ' 100' and ' 180' into
+#               digit pieces where llama3 has a single ' 100' token. Nothing was
+#               adjusted to hide that.
+#
+# WHAT THE SHIFT COSTS, STATED RATHER THAN GLOSSED. core_llama3's prompt lengths
+# were authored as one-before / exactly-on / one-after triples around each page
+# boundary (7/8/9 and 15/16/17). Losing the BOS turns those into
+# two-before / one-before / exactly-on (6/7/8 and 14/15/16), so NO PROMPT here
+# ends one token PAST a boundary. The property is not lost, it MOVES INTO THE
+# CONTINUATION, which is teacher-forced into the same cache and is the part
+# actually scored: row [10] is prompt_len 8 + cont_len 1, so the single scored
+# position is index 8 -- the first slot of page 1 -- and row [19] is
+# prompt_len 16 + cont_len 1, scoring index 16, the first slot of page 2. An
+# off-by-one in the slot mapping or the block-table gather still shows as a
+# difference between the members of a triple; it shows on a scored continuation
+# token rather than on a prompt token.
+#   entropy     every prompt_len bucket carries at least one strongly-determined
+#               continuation (a factual completion, marked `determined` in the
+#               per-entry comment) and at least one open-ended one (`open`), so
+#               the measurement is not taken entirely on near-deterministic
+#               tokens -- where a log-prob difference is small for reasons that
+#               have nothing to do with the port -- nor entirely on flat
+#               distributions, where it is large for the same reason. The labels
+#               are core_llama3's, unchanged: they describe the sentence, not the
+#               tokenizer.
+#
+# IDS, NOT TEXT, on the same rule tests/instance.yaml's `prompt_token_ids`
+# follows: THE FREEZER MUST NOT DEPEND ON A TOKENIZER. The `text` and `cont_text`
+# fields are comments for human readers and are NOT read by anything -- they were
+# encoded once, inside `t2j-model:qwen2`, with
+# `AutoTokenizer.from_pretrained("/data/Qwen/Qwen2.5-0.5B-Instruct")` and
+# `add_special_tokens=False`. Every row was round-tripped at encode time --
+# `tok.decode(prompt_token_ids) == text` and likewise for the continuation, for
+# all 25 rows -- so the comment fields provably describe the ids beside them.
+# Editing one of them changes NOTHING; editing the ids without re-freezing
+# invalidates golden/held_out.npz.
+#
+# HAND-EDITABLE. This file sits beside tests/instance.yaml in
+# the task generator's not-owned list; the rest of tests/ is generated.
+prompts:
+  # [ 0] prompt_len  2  cont_len  1  determined
+  - text: 'The capital'
+    cont_text: ' of'
+    prompt_token_ids: [785, 6722]
+    cont_token_ids: [315]
+  # [ 1] prompt_len  2  cont_len  6  determined
+  - text: 'Water boils'
+    cont_text: ' at 100 degrees'
+    prompt_token_ids: [28253, 88955]
+    cont_token_ids: [518, 220, 16, 15, 15, 12348]
+  # [ 2] prompt_len  2  cont_len  8  open
+  - text: 'She wondered'
+    cont_text: ' whether the letter would ever arrive at all'
+    prompt_token_ids: [7941, 30056]
+    cont_token_ids: [3425, 279, 6524, 1035, 3512, 17331, 518, 678]
+  # [ 3] prompt_len  2  cont_len 12  open
+  - text: 'Paris is'
+    cont_text: ' a city that has been rebuilt and reimagined many times'
+    prompt_token_ids: [59604, 374]
+    cont_token_ids: [264, 3283, 429, 702, 1012, 59585, 323, 312, 28016, 1589, 1657, 3039]
+  # [ 4] prompt_len  6  cont_len  1  determined
+  - text: 'The chemical symbol for gold is'
+    cont_text: ' Au'
+    prompt_token_ids: [785, 11483, 7735, 369, 6623, 374]
+    cont_token_ids: [32050]
+  # [ 5] prompt_len  6  cont_len  6  determined
+  - text: 'The boiling point of water is'
+    cont_text: ' 100 degrees Celsius'
+    prompt_token_ids: [785, 49837, 1459, 315, 3015, 374]
+    cont_token_ids: [220, 16, 15, 15, 12348, 61347]
+  # [ 6] prompt_len  6  cont_len  8  open
+  - text: 'She looked out of the window'
+    cont_text: ' and watched the rain come down over the'
+    prompt_token_ids: [7941, 6966, 700, 315, 279, 3241]
+    cont_token_ids: [323, 15384, 279, 11174, 2525, 1495, 916, 279]
+  # [ 7] prompt_len  7  cont_len  1  open
+  - text: 'He walked into the room and saw'
+    cont_text: ' a'
+    prompt_token_ids: [1519, 14858, 1119, 279, 3054, 323, 5485]
+    cont_token_ids: [264]
+  # [ 8] prompt_len  7  cont_len  4  determined
+  - text: 'Water is a compound made of two'
+    cont_text: ' hydrogen atoms and one'
+    prompt_token_ids: [28253, 374, 264, 23628, 1865, 315, 1378]
+    cont_token_ids: [34684, 32199, 323, 825]
+  # [ 9] prompt_len  7  cont_len  8  open
+  - text: 'He picked up the pen and slowly'
+    cont_text: ' wrote the first sentence of a letter he'
+    prompt_token_ids: [1519, 12771, 705, 279, 5750, 323, 13970]
+    cont_token_ids: [6139, 279, 1156, 11652, 315, 264, 6524, 566]
+  # [10] prompt_len  8  cont_len  1  determined
+  - text: 'The first president of the United States was'
+    cont_text: ' George'
+    prompt_token_ids: [785, 1156, 4767, 315, 279, 3639, 4180, 572]
+    cont_token_ids: [9857]
+  # [11] prompt_len  8  cont_len  4  determined
+  - text: 'The largest planet in our solar system is'
+    cont_text: ' Jupiter, the fifth'
+    prompt_token_ids: [785, 7772, 11580, 304, 1039, 12941, 1849, 374]
+    cont_token_ids: [49689, 11, 279, 17702]
+  # [12] prompt_len  8  cont_len  8  open
+  - text: 'The old man sat on the bench and'
+    cont_text: ' watched the rain come down over the empty'
+    prompt_token_ids: [785, 2310, 883, 7578, 389, 279, 13425, 323]
+    cont_token_ids: [15384, 279, 11174, 2525, 1495, 916, 279, 4287]
+  # [13] prompt_len 14  cont_len  1  open
+  - text: 'When the storm finally passed, the villagers came out of their houses and'
+    cont_text: ' began'
+    prompt_token_ids: [4498, 279, 13458, 5499, 5823, 11, 279, 60821, 3697, 700, 315, 862, 14967, 323]
+    cont_token_ids: [6009]
+  # [14] prompt_len 14  cont_len  6  determined
+  - text: 'In geometry, the interior angles of any triangle always add up to exactly'
+    cont_text: ' 180 degrees.'
+    prompt_token_ids: [641, 17047, 11, 279, 14791, 25941, 315, 894, 21495, 2677, 912, 705, 311, 6896]
+    cont_token_ids: [220, 16, 23, 15, 12348, 13]
+  # [15] prompt_len 14  cont_len  8  open
+  - text: 'The rain had stopped, and the street outside was quiet except for the'
+    cont_text: ' sound of water dripping from the gutters'
+    prompt_token_ids: [785, 11174, 1030, 10497, 11, 323, 279, 8592, 4889, 572, 11340, 3650, 369, 279]
+    cont_token_ids: [5112, 315, 3015, 76215, 504, 279, 17859, 5045]
+  # [16] prompt_len 15  cont_len  1  determined
+  - text: 'The Declaration of Independence was signed in seventeen seventy six by the United States of'
+    cont_text: ' America'
+    prompt_token_ids: [785, 40921, 315, 43077, 572, 8499, 304, 81397, 69949, 4743, 553, 279, 3639, 4180, 315]
+    cont_token_ids: [5159]
+  # [17] prompt_len 15  cont_len  4  determined
+  - text: 'In computer science, a hash table stores key value pairs and supports lookup in'
+    cont_text: ' constant time on average'
+    prompt_token_ids: [641, 6366, 8038, 11, 264, 5175, 1965, 10533, 1376, 897, 13530, 323, 11554, 18615, 304]
+    cont_token_ids: [6783, 882, 389, 5461]
+  # [18] prompt_len 15  cont_len  8  open
+  - text: 'The letter had been sitting on the hall table for three days before anyone thought'
+    cont_text: ' to open it, and by then the'
+    prompt_token_ids: [785, 6524, 1030, 1012, 11699, 389, 279, 13994, 1965, 369, 2326, 2849, 1573, 5489, 3381]
+    cont_token_ids: [311, 1787, 432, 11, 323, 553, 1221, 279]
+  # [19] prompt_len 16  cont_len  1  open
+  - text: 'The Great Wall of China was built over many centuries by successive dynasties to'
+    cont_text: ' keep'
+    prompt_token_ids: [785, 8513, 9736, 315, 5616, 572, 5798, 916, 1657, 23631, 553, 48924, 31070, 559, 550, 311]
+    cont_token_ids: [2506]
+  # [20] prompt_len 16  cont_len  4  determined
+  - text: 'The Amazon rainforest spans nine countries in South America and produces a large share of'
+    cont_text: " the world's oxygen"
+    prompt_token_ids: [785, 8176, 11174, 50655, 44295, 11627, 5837, 304, 4882, 5159, 323, 18644, 264, 3460, 4332, 315]
+    cont_token_ids: [279, 1879, 594, 23552]
+  # [21] prompt_len 16  cont_len  8  open
+  - text: 'The library had been closed for years, and when they finally opened the doors again'
+    cont_text: ' the room smelled of dust and old paper'
+    prompt_token_ids: [785, 6733, 1030, 1012, 7877, 369, 1635, 11, 323, 979, 807, 5499, 8930, 279, 14038, 1549]
+    cont_token_ids: [279, 3054, 85698, 315, 15797, 323, 2310, 5567]
+  # [22] prompt_len 22  cont_len  1  determined
+  - text: 'The periodic table arranges the chemical elements by increasing atomic number, and the element with atomic number one is called'
+    cont_text: ' hydrogen'
+    prompt_token_ids: [785, 38345, 1965, 2890, 5520, 279, 11483, 5424, 553, 7703, 24510, 1372, 11, 323, 279, 2392, 448, 24510, 1372, 825, 374, 2598]
+    cont_token_ids: [34684]
+  # [23] prompt_len 22  cont_len  4  determined
+  - text: 'The theory of general relativity, published by Albert Einstein in nineteen fifteen, describes gravity not as a force but'
+    cont_text: ' as a curvature of'
+    prompt_token_ids: [785, 10126, 315, 4586, 1351, 43415, 11, 4652, 553, 17513, 54052, 304, 93835, 36655, 11, 16555, 23249, 537, 438, 264, 5344, 714]
+    cont_token_ids: [438, 264, 82133, 315]
+  # [24] prompt_len 22  cont_len  8  open
+  - text: 'After the harvest was in and the barns were full, the family sat down at the long wooden table and'
+    cont_text: ' talked until the candles had burned right down'
+    prompt_token_ids: [6025, 279, 23429, 572, 304, 323, 279, 32319, 82, 1033, 2480, 11, 279, 2997, 7578, 1495, 518, 279, 1293, 22360, 1965, 323]
+    cont_token_ids: [14897, 3080, 279, 51205, 1030, 26626, 1290, 1495]

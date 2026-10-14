@@ -1,0 +1,641 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ragged/gemma4 -- the instance's own data. The grader hardcodes nothing
+# per-instance: the freezer mirrors every key here into
+# golden/meta.json and `tests/fixtures.py` reads it back from there.
+#
+# Every key is checked against the freezer's known instance keys, so a
+# typo is a refusal rather than a silently-defaulted value.
+#
+# THE MODE-AXIS CONTROL FOR THE gemma4 FAMILY. Same checkpoint, same family
+# reference code and the same family thresholds as `core_gemma4`; the only axis
+# that moves is `mode`. Everything below that differs from that instance's
+# instance.yaml differs because a persistent multi-sequence batch requires it,
+# and each such line says so. Two values that a reader might expect to be
+# inherited are NOT -- `num_pages` (forced by max_num_seqs) and `sampler_grid`
+# (the ragged sampler row is sequence 2's, not sequence 0's) -- and both carry
+# their own measurement.
+
+mode: ragged
+model: gemma4
+model_name_or_path: google/gemma-4-E2B-it
+
+# NO `is_moe` AND NO `multimodal`, and both absences are deliberate rather than
+# oversights. gemma-4-E2B declares `enable_moe_block: false` and
+# `num_experts: null` (the 26B-A4B sibling is the MoE one), and this instance is
+# the TEXT PATH ONLY of a tri-modal checkpoint -- see tests/instance_context.md,
+# which is the one place in the tree that states that scope. Both keys are
+# family-scoped in the harness's instance-symmetry waivers and
+# declaring either here would be a claim about a surface this instance does not
+# grade.
+
+# --------------------------------------------------------------------------- #
+# Precision.
+# --------------------------------------------------------------------------- #
+# The serving tier, as for every instance in this class.
+precision_profile: bf16_native
+dtype: bfloat16
+
+# Every value below is backed by a floor taken on this instance rather than
+# inherited from `core_gemma4`, even where the number came out the same. The
+# floors are recorded by observing what `check_array`, `centered_cosine`,
+# `check_logits_strict` and the four behavioural readers actually saw, rather
+# than by a numpy reimplementation of them, over the whole graded suite with
+# `JAX_DEFAULT_MATMUL_PRECISION=highest` and `--xla_gpu_autotune_level=0`;
+# 69 abs_tol rows, 53 centered-cosine rows, 17 logits_strict rows, 4 behavioural
+# rows, 1 decode-margin row. The multiple each declared value carries over its
+# measured floor is stated beside it; where a value coincides with the
+# class-wide one or with the family parent's that is a RESULT, not an
+# inheritance.
+fp32_thresholds:
+  abs_tol: 1.0e-4                    # floor 1.0244e-05 (global_rotary_emb.out0) -- 9.8x
+  centered_cosine_floor: 0.9999995   # measured 0.999999701977 -- 1.68x
+  logprob_atol: 4.0e-04              # measured 2.1815e-05 -- 18x
+  # TIGHTENED FROM THE CLASS-WIDE 1.7e-03, which carried 76x here. Set to the
+  # same 18x multiple as the per-token row above, since the two are the same
+  # measurement summed differently and there is no reason for their headroom to
+  # differ by a factor of four.
+  logprob_cumulative_atol: 4.0e-04   # measured 2.2441e-05 -- 18x
+  held_out_logprob_atol: 7.5e-04     # measured 7.0572e-05 -- 10.6x
+  # TIGHTENED FROM THE CLASS-WIDE 4.0e-03, as `core_gemma4` did, and backed
+  # here rather than carried: 1.5e-03 against 1.3279e-04.
+  held_out_seq_atol: 1.5e-03         # measured 1.3279e-04 -- 11.3x
+
+native_thresholds:
+  # AT ITS EXACT FLOOR -- 1.00x, and the tightest number in this file after
+  # `max_kl`. On `core_gemma4` this key was free (zero decisive disagreements on
+  # all twelve logit surfaces at every rung of the ladder, so the floor was 0.0
+  # and 0.1875 was kept for want of information). NOT SO HERE: sixteen of this
+  # instance's seventeen logit surfaces still report zero, and the seventeenth --
+  # `batch_composition_battery[d1p2]`, the 164-row variant that re-stages
+  # sequence 1 as a prefill -- has THREE rows whose top-1 disagrees across the
+  # two frameworks, all three at a golden gap inside [0.125, 0.1875). So 0.1875
+  # is the LOWEST rung at which this instance is green and 0.125 would make it
+  # red. 551 decisive rows at margin 0.0 across the suite, 2 exact
+  # ties, 3 disagreements. They are ordinary bf16 near-ties on non-decisive rows
+  # of a soft-capped forward -- exempting them is precisely what this threshold
+  # is for -- and the same rows agree bit-for-bit at fp32 in the parity checks.
+  # NOT RAISED to buy slack: 0.375 would cost decisive rows on every surface for
+  # a quantity that is deterministic under the two graded pins. If it ever fires
+  # it presents as a numeric failure on `test_batch_composition_battery`.
+  argmax_margin: 0.1875
+  # The golden's SMALLEST decode margin is 0.3125 (steps 0 and 2; the eight are
+  # 0.3125 / 4.5 / 0.3125 / 2.875 / 0.90625 / 8.5 / 0.5625 / 8.125, read
+  # from the frozen artifacts). This key is a CEILING -- the check excuses a divergence only BELOW
+  # it -- so at 0.125 nothing is excused, which is the strongest position
+  # available, and it clears the smallest golden margin by 2.50x.
+  decisive_margin: 0.125
+  # 0.967, AND IT IS NOW THE LOOSEST LOGIT FLOOR IN THE CLASS BY 1.3x. That is
+  # a real cost and it is argued rather than asserted, because the number is set
+  # by ONE ROW of ONE battery variant.
+  #
+  # THE PER-SURFACE CENTERED COSINES (one surface below 0.99):
+  #     batch_composition_battery[d1p2]   0.9824992418   <- binding, row 120
+  #     prefill_logits                    0.9965974092      row 124
+  #     ragged_forward_logits/request_1   0.9965974092
+  #     ragged_forward_logits/request_0   0.9979789853      row 13
+  #     hidden_35                         0.9986535907
+  #     test_batching_invariance          0.9991295338
+  #     ragged_forward_logits/request_2   0.9992028475
+  #     batch_composition_battery[d2p1]   0.9956487617   (taken separately; the
+  #                                       graded run aborted at d1p2 before it)
+  # -- so every surface but one clears 0.99, and the binding surface misses it
+  # by 7.5e-03.
+  #
+  # WHY THAT ROW IS PATHOLOGICAL, and why chasing it is not available. `d1p2`
+  # re-stages sequence 1 (130 tokens) as a PREFILL, so it carries 130 rows that
+  # no other frozen artifact holds. Row 120 has 10 124 of its 262 144 logits
+  # pinned at EXACTLY +-30.0 by `final_logit_softcapping: 30.0`, which upstream
+  # applies as `tanh(x/30)*30` IN THE HEAD'S OWN DTYPE -- bfloat16 on this tier.
+  # `tanh` is contractive, so the cap compresses the row: its centered L2 norm
+  # is 163.78 against a canonical-forward minimum of 204.12 and a whole-tree
+  # maximum of 2801.26. A centered cosine divides by that norm while the bf16
+  # quantum near |logit| 30 does not shrink with it, so the statistic collapses
+  # for a reason that has nothing to do with the port. Across the two
+  # variants: 1 row of 164 below 0.99 in `d1p2`, 0 of 35 in `d2p1`, and the
+  # NEXT-worst row in `d1p2` is 0.9925.
+  #
+  # THE PORT IS NOT IN QUESTION on that row. The parity checks compare the same
+  # mixed batch at fp32 and reads 4.995e-06 worst relative disagreement with the
+  # two sides' argmax equal on every row; `check_logits_strict`'s KL and cosine
+  # clauses both pass on `d1p2` at the native tier.
+  #
+  # THE MULTIPLE: 1 - 0.967 is 1.886x the measured 1 - 0.9824992418 = 1.750e-02,
+  # which is the 1.87-1.91x ratio `core_gemma4` used on all three of the keys it
+  # loosened. It is NOT set finer than that on purpose -- 0.98 would carry 1.14x
+  # and 0.975 only 1.43x, and this is a bf16 reading on a saturated row.
+  #
+  # WHAT IT COSTS, stated because it is not free: the next-worst logit surface
+  # goes from 2.94x headroom at 0.99 to 9.7x at 0.967. A per-surface override
+  # would have been the right instrument and IS NOT AVAILABLE for this clause:
+  # `_centered_floor` takes a `surface` argument and `instance.yaml` can carry
+  # `centered_cosine_floor.<surface>`, but `_assert_logit_parity` calls it
+  # WITHOUT one, so only `_assert_array_parity`'s array surfaces can use the
+  # hook -- and the hook's own docstring says it exists to protect "the LOGIT
+  # clause, which is the sensitive one, and the one this floor was calibrated
+  # for". Reported as a class-wide gap; not fixed here, because widening a
+  # shared graded module to loosen one check is the wrong direction of change
+  # for a family arm.
+  centered_cosine_floor: 0.967
+  # DOTTED KEYS, and they reach the grader through `native_extras` ->
+  # `_surface_band` rather than through `_band()`. All three are declared
+  # because an absent one silently grades at the tier value
+  # (enforced by the harness's instance-symmetry check).
+  #
+  # NO `centered_cosine_floor.hidden_states` OVERRIDE, and that absence is a
+  # MEASUREMENT rather than an omission -- which is the one thing an absent
+  # threshold key is normally not, so it is argued here.
+  #
+  # Five instances declare that override and all five do it to LOOSEN a hidden
+  # surface that is an order of magnitude worse than their logits. Here the
+  # hidden states are the BETTER of the two by 13x:
+  #
+  #     logits   batch_composition_battery[d1p2]  0.9824992418  (1-cos 1.750e-02)
+  #     hidden   hidden_35                        0.9986535907  (1-cos 1.346e-03)
+  #
+  # so the tier value set by the worse of the two carries 1.886x on the logits
+  # and 24.5x on the hidden states. A per-surface override could only TIGHTEN
+  # the hidden clause, which is a change with no failure behind it, and the
+  # class rule is that a threshold moves on a measurement.
+  #
+  # THE 0.998 OVERRIDE CONSIDERED ON `core_gemma4` IS NOT ADOPTED, and the
+  # reason is carried here rather than dropped because it is a property of
+  # the INSTRUMENT, it recurs on this instance in a second form (see the
+  # `centered_cosine_floor` block above: the floor run aborted at `d1p2` and so
+  # never recorded `d2p1`'s cosine at all, which had to be taken separately), and
+  # the next arm will meet it again.
+  # The floor diagnostic reported the hidden minimum as
+  # 0.9994571209 at hidden_12 -- and that was true of the run it saw. In that
+  # run `abs_tol.hidden_states` was still 1.0, so `_assert_array_parity` raised
+  # at hidden_35 (floor 1.04688) BEFORE `test_hidden_states` reached the
+  # `centered >= floor` line for that layer. The plugin records what the gates
+  # SAW, so a clause never reached is a clause never recorded, and the reported
+  # minimum was over layers 0..34 only. The real failure is at exactly
+  # hidden_35, at 0.9968481064. RE-MEASURE AFTER FIXING AN EARLIER CLAUSE IN THE
+  # SAME CHECK.
+  abs_tol.kv_cache_state: 0.5        # floor 0.2723907 (cache_group0) -- 1.84x
+                                     # (group1's own floor is 0.1613, 3.1x)
+  # 2.0, WHICH IS `core_gemma4`'s VALUE ARRIVED AT INDEPENDENTLY -- backed here
+  # by this instance's own 126-row mixed forward rather than carried: the floor is
+  # 1.071875 at hidden_35, the post-final-norm row (that instance's floor is
+  # 1.04688 on its 124-row single-sequence one). 2.0 carries 1.87x.
+  # `_shallow_abs_cap` rescales this by the reference's own running peak at each
+  # depth, so what grades the shallow layers is a fraction of it and not the
+  # declared value: hidden_24 needs 0.2367 and hidden_13 needs 0.1961.
+  abs_tol.hidden_states: 2.0
+
+  # NO `max_kl` KEY, AND THAT IS THE TIGHTEST NUMBER IN
+  # THIS FILE. `max_kl` comes from the `bf16_native` profile at 0.1 and no
+  # instance in this class declares its own. The worst per-token softmax KL,
+  # read by `check_logits_strict` itself, is 7.3354e-02,
+  # on `prefill_logits` and on `ragged_forward_logits/request_0` (the same rows;
+  # request 0's graded query IS the canonical prefill). That is 1.36x headroom,
+  # against 16.07x / 5.95x / 5.43x / 13.18x recorded on earlier cells -- by a
+  # wide margin the tightest reading the class has taken.
+  #
+  # NOT LOOSENED, and the reason is that loosening it is not the cheap move it
+  # looks like: it would add a key no instance declares, so the harness's
+  # instance-symmetry check would demand a waiver, and the quantity
+  # is DETERMINISTIC under the two graded pins. What it is instead is the number the next
+  # gemma4 arm should look at first: `chunked_gemma4`'s canonical forward is the
+  # same 124 rows and will land near it, and the KL clause is BINDING here --
+  # `check_logits_strict` deliberately does not apply the `_KL_COSINE_OVERRIDE`
+  # that would let a high cosine excuse it. The cause is the family's own
+  # `final_logit_softcapping: 30.0`, applied in bf16: a contractive cap makes
+  # the softmax more sensitive per bf16 ULP than an uncapped head is.
+
+seed: 42
+
+# --------------------------------------------------------------------------- #
+# Geometry. TWO CONSTRAINTS THAT ARE NOT ANY OTHER INSTANCE'S.
+# --------------------------------------------------------------------------- #
+# 1. `max_model_len` IS 544 AND NOT ~160, AND THE REASON IS THE SLIDING WINDOW.
+#
+# `sliding_window` is 512 on this checkpoint (four times `core_gpt_oss`'s 128),
+# and 28 of the 35 layers use it. A probe that never reaches 512 tokens makes
+# every sliding layer behave EXACTLY like a full one, so "window every sliding
+# layer" and "window no layer" both grade green -- the same hole `core_gpt_oss`
+# raised its prompt to 135 to close.
+#
+# CLOSING IT WITH THE MAIN PROBE WAS PRICED AND REJECTED. At prompt_len 520 the
+# frozen logits alone are 520 x 262144 x 4 B = 545 MB, and the golden tree comes
+# out near 1.6 GB against `core_gpt_oss`'s measured 424 MB -- the largest in the
+# class by 3.8x, on the family that already has the largest reference. So the
+# window is crossed on the L6 HELD-OUT path instead, which freezes per-token
+# log-probs and not logits: one 520-token entry in tests/held_out_prompts.yaml
+# costs ~2 KB of golden and puts 512 genuinely-clipped positions through 28
+# sliding layers on a graded check. `max_model_len` exists to admit that entry.
+#
+# WHAT IT COSTS THE MAIN PROBE, stated because it is not free: `pages_per_seq`
+# must reach `max_model_len / page_size` = 17, and `paged_attention` gathers
+# `pages_per_seq * page_size` = 544 KV positions for every query token whatever
+# the sequence length. On this family that gather is cheap -- `num_kv_heads` is
+# 1, so `jnp.repeat(keys, 8, axis=2)` is a broadcast rather than a
+# materialisation, and the [124, 544, 1, 512] fp32 intermediate on a full layer
+# is 138 MB transient. `core_gpt_oss`, with 8 KV heads, materialises 424 MB at a
+# third of the width.
+#
+# 2. THE LAST DECODE STEP OPENS A PAGE THE PROMPT NEVER REACHED. prompt_len 124
+# spans ceil(124/32) = 4 pages; the run reaches 124 + 8 = 132 and spans 5. That
+# is what makes `generate`'s final decode_step observable in the frozen cache
+# (`engine.generate` says why the last step's logits are discarded but its WRITE
+# is not), and it is why prompt_len is 124 rather than the 128 that would sit
+# exactly on the boundary.
+#
+# 3. `num_pages` IS 51 AND THAT IS FORCED, NOT CHOSEN. RunConfig.__post_init__
+# requires pages_per_seq * page_size >= max_model_len (17 * 32 = 544 >= 544) and
+# num_pages >= max_num_seqs * pages_per_seq (51 >= 3 * 17 = 51). The second
+# relation is what moves with the mode: `core_gemma4` needs 17 and declares 20;
+# a three-request block table advertises 51 pages and a pool smaller than its
+# own advertisement is refused. 51 IS THE EXACT FLOOR and no headroom is added,
+# which is a departure from `ragged_gpt_oss` (24 against a floor of 18) and from
+# `core_gemma4` (20 against 17) -- both of those quote "headroom the allocator
+# probes use", and that reason does not survive reading the probe: the
+# paging-invariance legs are `i -> i` and `i -> 50 - i`, `_permuted_pages`'
+# docstring states in terms that DISJOINTNESS IS NOT REQUIRED and was never
+# true class-wide anyway, and the two maps here are disjoint regardless (the
+# default set is [0, 1, 2, 3] for a 124-token prompt and the permuted set
+# [50, 49, 48, 47]). The batch itself occupies 12 of the 51, all below index 15,
+# so 39 pages are free for `pool.allocate` in the cache-reuse and allocator
+# probes. Every extra page costs real golden bytes -- `kv_cache_state.npz` is
+# `sum_groups(n_slots * num_pages * page_size * 2 * n_kv * head_dim)` at fp32,
+# 1.18 MB per page on this family's two groups -- so the floor is the honest
+# value.
+page_size: 32
+num_pages: 51
+max_num_seqs: 3
+pages_per_seq: 17
+max_model_len: 544
+
+# NON-IDENTITY EVERYWHERE, and validate_geometry refuses anything else: over a
+# page where page_ids[i] == i the slot equals the position, so a candidate that
+# ignored block_tables and indexed the cache flat would reproduce
+# kv_cache_state.npz exactly. Five ids because the run spans
+# ceil((124 + 8) / 32) = 5 pages.
+#
+# UNCHANGED FROM `core_gemma4`, deliberately: this is sequence 0's page
+# assignment and `validate_sequences` hard-refuses a `sequences[0]` that does
+# not restate it. Holding it fixed is what makes the two instances comparable
+# along the mode axis. The two ADDED sequences' pages are in the `sequences`
+# block below and are disjoint from these five.
+page_ids: [3, 0, 5, 1, 7]
+
+# The K sweep. FOUR legs -- three fitting
+# points once `fit_step_time` drops call 1, the minimum at which it has a degree
+# of freedom to see a bad call in. `num_decode_steps` (8) MUST be one of these
+# four: `perf_probe` samples `tokens` -- the work gate's subject -- only on that
+# leg, and the gate silently gets `None` if the coupling breaks.
+# Feasibility, this instance's own geometry: ceil((124 + 16) / 32) = 5 <= 17,
+# and 124 + 16 = 140 <= 544. The harness
+# enforces both, per instance.
+perf_k_values: [2, 4, 8, 16]
+
+prompt_len: 124
+num_decode_steps: 8
+
+# gemma-4's own SentencePiece-derived tokenizer, vocab 262144. Encoded with
+#   Tokenizer.from_file("google/gemma-4-E2B-it/tokenizer.json")
+#     .encode(text, add_special_tokens=False).ids
+# and `<bos>` (id 2) PREPENDED BY HAND, unlike core_gpt_oss's bare completion
+# prompt. That is not a style choice: gemma-4's tokenizer.json carries a
+# `TemplateProcessing` post-processor whose `special_tokens` table is EMPTY, so
+# `add_special_tokens=True` adds nothing and the tokenizer will never emit a BOS
+# of its own -- while `generation_config.json` declares `bos_token_id: 2` and
+# every gemma model is trained with it. A prompt without it is off-distribution
+# in a way that is invisible to every shape check.
+#
+# The text is a plain factual continuation, chosen so the greedy trajectory is
+# decisive enough for `test_greedy_sequence` to be a real comparison. On the
+# reference at bf16 the 16-step greedy continuation is
+#   " cities like Paris, London, Rome, and many others."
+# at a mean step log-prob of -0.21, i.e. fluent and strongly determined.
+#
+#   "The capital of France is Paris, and the capital of Japan is Tokyo. Rivers
+#    shape the cities built beside them: the Seine divides Paris into a left
+#    bank and a right bank, the Thames runs east through London to the sea, and
+#    the Danube passes through four national capitals on its way from the Black
+#    Forest to the Black Sea. A river is also a boundary, a trade route, and a
+#    source of drinking water, which is why so many of the oldest settlements
+#    in Europe and Asia were founded on one. Bridges, ferries and embankments
+#    followed. The list of such river cities is long, and it begins with"
+prompt_token_ids: [2, 818, 5279, 529, 7001, 563, 9079, 236764, 532, 506, 5279,
+  529, 6056, 563, 21038, 236761, 36835, 6230, 506, 9979, 5284, 28383, 1091,
+  236787, 506, 69598, 59529, 9079, 1131, 496, 2378, 4856, 532, 496, 1447, 4856,
+  236764, 506, 77634, 8784, 13512, 1343, 5860, 531, 506, 5442, 236764, 532, 506,
+  99836, 16349, 1343, 2390, 4559, 115441, 580, 1061, 1595, 699, 506, 5561, 13988,
+  531, 506, 5561, 12991, 236761, 562, 8858, 563, 992, 496, 10134, 236764, 496,
+  5754, 9116, 236764, 532, 496, 3738, 529, 15403, 1813, 236764, 837, 563, 3217,
+  834, 1551, 529, 506, 24625, 53965, 528, 3879, 532, 11560, 964, 16311, 580, 886,
+  236761, 81689, 236764, 181140, 532, 120157, 1230, 6641, 236761, 669, 1694, 529,
+  1288, 8858, 9979, 563, 1440, 236764, 532, 625, 12502, 607]
+
+# =========================================================================== #
+# THE MIXED BATCH -- the only thing `ragged` adds to the scenario, and the
+# reason four graded checks that deselect on `core` apply here.
+#
+# `request_distribution` is [n_decode, n_prefill, n_mixed] and
+# `test_ragged_forward_logits` refuses a scenario with a zero in either of the
+# first two slots: "a `ragged` scenario with a zero decode count is a prefill
+# scenario wearing the wrong label". Two decode + one prefill gives [2, 1, 0].
+#
+# A `decode` sequence contributes exactly ONE query token (its last) and a
+# `seq_len` equal to its FULL length, so its query attends to KV that this
+# forward did not write. That is the whole difference between a decode request
+# and a prefill request, and it is why the freeze runs a WARM-UP forward first
+# (`inputs.npz`'s `warmup_*` arrays) that prefills every decode sequence's
+# prefix.
+#
+# THE SHAPE IS `ragged_gpt_oss`'s, AND THAT IS A DERIVATION RATHER THAN A COPY.
+# That instance is the only other `ragged` cell at `page_size: 32`, and every
+# length below is re-derived for THIS tokenizer against the page arithmetic
+# rather than carried: its own block records that inheriting `ragged_llama3`'s
+# 9-token sequence at page_size 32 would have silently lost the two-page
+# property and still frozen, graded 1.0 and looked right. The three page lists
+# ARE that instance's ([12, 8, 11, 9, 10] and [14, 13]); they are re-checked
+# here against `validate_sequences`' four clauses at THIS instance's
+# `num_pages: 51` rather than assumed to still hold.
+#
+# THE FIVE PROPERTIES THIS BATCH IS BUILT TO HAVE:
+#
+#   1. sequences[0] RESTATES the top-level `prompt_token_ids` and `page_ids`.
+#      `validate_sequences` hard-refuses otherwise, because the generation,
+#      decode-step, serve and held-out probes are single-sequence on every mode
+#      and read the top-level keys directly. (The SAMPLER probe is NOT in that
+#      list on this mode -- see property 5.)
+#   2. MIXED STAGES: one `prefill`, two `decode` -> [2, 1, 0].
+#   3. PAGES ARE DISJOINT, NON-IDENTITY AND IN RANGE. 12 of the 51 pages are
+#      used, no page is shared, and no list is `page_ids[i] == i` anywhere.
+#      None of the three lists is contiguous-ascending either: a candidate that
+#      read `block_table[0] + i` instead of `block_table[i]` -- the "the
+#      allocator hands out consecutive pages" assumption -- would reproduce an
+#      ascending list exactly and is caught only by a scrambled one.
+#   4. EVERY REQUEST SPANS MORE THAN ONE PAGE, so the block table's later
+#      entries are load-bearing: sequences 0 and 1 occupy 5 pages each and
+#      sequence 2 occupies 2. Sequence 2 is sized so its single decode query
+#      token is the FIRST token of its second page (position 32 = 1 * page_size,
+#      offset 0). A block-table gather that is absent, reversed or off by one
+#      reaches a different page for that one token, and it is the only token in
+#      the batch whose page index changes under an off-by-one in
+#      `position // page_size` -- sequence 1's query token sits at offset 1 of
+#      its page (position 129) and sequence 0's last prefill row at offset 27
+#      (position 123).
+#   5. THE SLIDING WINDOW IS INERT ON ALL THREE REQUESTS, AND THAT IS STATED
+#      RATHER THAN LEFT TO BE ASSUMED. This is the ONE property
+#      `ragged_gpt_oss`'s batch has that this one CANNOT have, and the reason is
+#      arithmetic, not taste: gemma-4's `sliding_window` is 512 where gpt-oss's
+#      is 128, and `pages_per_seq * page_size` is 544, so the longest request
+#      this geometry admits (536 tokens, since `n + num_decode_steps <= 544`)
+#      clips 24 of its own 536 keys on one query row. Reaching the window at all
+#      would cost a 536-token request whose `battery/batch_composition/d1p2`
+#      variant re-stages it as a PREFILL -- 1 + 536 + 33 = 570 graded query rows
+#      at 262144 logits each, 598 MB in one npz, against the 172 MB the batch
+#      below costs -- and the measured band it would be graded against
+#      (`abs_tol` on native logits) is two orders looser than the movement a
+#      windowless port produces. `core_gemma4` priced the identical trade for
+#      its main probe and rejected it for the identical reason; the family's
+#      window coverage is on the L6 held-out path, whose 520-token entry is
+#      inherited here unchanged in tests/held_out_prompts.yaml and whose
+#      `held_out_logprob_atol` of 7.5e-04 is 108x below the 8.099e-02 a
+#      windowless port produces there.
+#
+#      VERIFIED ON THIS BATCH WITH A POSITIVE CONTROL,
+#      because a falsification that reports zero has to prove it could have
+#      reported something else. Both runs: the reference at bf16,
+#      the graded pins, the same warm-up + graded pair the freezer runs, with
+#      only `layer.self_attn.sliding_window` varied.
+#
+#        sliding_window        seq 0 (n=124)  seq 1 (n=130)  seq 2 (n=33)
+#        512 -> None            0.000000       0.000000       0.000000
+#        512 ->   16 (control)  6.500000      16.968750       5.750000
+#
+#      (max |d| on the request's graded logit row, in logit units. The argmax is
+#      unchanged in all six cells.) So the knob is live and reaches the
+#      computation -- the zeros are a measurement, not a perturbation that
+#      missed. `core_gemma4` reports the same 0.000000 on its own 124-token
+#      probe and 8.099e-02 at 520 tokens; this batch's longest request is 130.
+#
+# AND ALL THREE ARE TRUNCATED ONTO A STRONGLY DETERMINED CONTINUATION, which is
+# not optional and whose cost this class has established when it is ignored.
+# `test_batching_invariance` compares the two legs' argmax with NO tie-break
+# latitude, and `test_ragged_forward_logits` grades the frozen forward at
+# `argmax_margin`. On a row whose top1-top2 gap is at or below one bf16 ULP both
+# are coin flips: arbitrary token ids can produce a gap of EXACTLY 0.0 on a
+# graded row, where a control mutation that changes no value at all appears to
+# "catch" the check.
+#
+# SEQUENCE 2 IS ALSO THE SAMPLER ROW ON THIS MODE, which is the coupling that
+# decides its text. `step_prefill_forward` sets `_prefill_last_logits =
+# logits[-1]` of the GRADED forward, and on a ragged batch row -1 is the LAST
+# request's row. So `golden/sampler.npz` -- and therefore every one of
+# `test_sampler_transforms`' criteria -- is screened against sequence 2 and NOT
+# against sequence 0. `ragged_llama3`'s own comment still claims its grid is
+# "byte-identical to core_llama3's, and deliberately so"; it is not, and that
+# stale sentence is reported as a class-wide documentation defect.
+#
+# The readings below come from the reference on the real checkpoint (bf16, the
+# graded path's own pins: JAX_DEFAULT_MATMUL_PRECISION=highest and
+# XLA_FLAGS=--xla_gpu_autotune_level=0).
+# =========================================================================== #
+sequences:
+  # Sequence 0, restated (property 1). prefill: all 124 tokens are query rows,
+  # and its last one is position 123 = 3 * 32 + 27.
+  - stage: prefill
+    page_ids: [3, 0, 5, 1, 7]
+    prompt_token_ids: [2, 818, 5279, 529, 7001, 563, 9079, 236764, 532, 506, 5279,
+      529, 6056, 563, 21038, 236761, 36835, 6230, 506, 9979, 5284, 28383, 1091,
+      236787, 506, 69598, 59529, 9079, 1131, 496, 2378, 4856, 532, 496, 1447,
+      4856, 236764, 506, 77634, 8784, 13512, 1343, 5860, 531, 506, 5442, 236764,
+      532, 506, 99836, 16349, 1343, 2390, 4559, 115441, 580, 1061, 1595, 699,
+      506, 5561, 13988, 531, 506, 5561, 12991, 236761, 562, 8858, 563, 992, 496,
+      10134, 236764, 496, 5754, 9116, 236764, 532, 496, 3738, 529, 15403, 1813,
+      236764, 837, 563, 3217, 834, 1551, 529, 506, 24625, 53965, 528, 3879, 532,
+      11560, 964, 16311, 580, 886, 236761, 81689, 236764, 181140, 532, 120157,
+      1230, 6641, 236761, 669, 1694, 529, 1288, 8858, 9979, 563, 1440, 236764,
+      532, 625, 12502, 607]
+
+  # Sequence 1 -- 130 tokens, 5 pages. Its query token is position 129 = 4 * 32
+  # + 1, i.e. offset 1 of the FIFTH block-table entry, which sequence 2's
+  # two-entry row cannot reach. Its pages are scrambled, not ascending
+  # (property 3).
+  #
+  #   "Water freezes at zero degrees Celsius and boils at one hundred degrees at
+  #    sea level. Metals conduct heat and electricity because their outer
+  #    electrons move freely through the lattice, which is why a copper wire
+  #    warms along its whole length while a wooden handle stays cool. Sound
+  #    travels faster through water than through air, and faster still through
+  #    steel. Light from the Sun reaches the Earth in about eight minutes, and
+  #    the Moon is close enough that the delay is barely more than a second.
+  #    Bare iron rusts when it is left in oxygen and water. The planets, listed
+  #    outward from the Sun, are Mercury, Venus, Earth, Mars, Jupiter, Saturn,
+  #    Uranus and"
+  - stage: decode
+    page_ids: [12, 8, 11, 9, 10]
+    prompt_token_ids: [2, 17390, 126521, 657, 5743, 10674, 57356, 532, 104264, 657,
+      886, 7549, 10674, 657, 5442, 1984, 236761, 61919, 4714, 5387, 532, 14855,
+      1547, 910, 14611, 16763, 2827, 25704, 1343, 506, 18928, 236764, 837, 563,
+      3217, 496, 14561, 8733, 147798, 3008, 1061, 3697, 3861, 1651, 496, 7116,
+      6060, 26432, 5427, 236761, 19997, 33036, 11442, 1343, 1813, 1082, 1343,
+      2634, 236764, 532, 11442, 2036, 1343, 8103, 236761, 10847, 699, 506, 7718,
+      20881, 506, 10824, 528, 1003, 6589, 4310, 236764, 532, 506, 19656, 563,
+      3107, 3487, 600, 506, 9249, 563, 25681, 919, 1082, 496, 1855, 236761,
+      84774, 8603, 16432, 236751, 1056, 625, 563, 2378, 528, 12123, 532, 1813,
+      236761, 669, 46501, 236764, 9456, 44630, 699, 506, 7718, 236764, 659,
+      50144, 236764, 44014, 236764, 10824, 236764, 23156, 236764, 52895, 236764,
+      56949, 236764, 204351, 532]
+
+  # Sequence 2 -- 33 tokens, 2 pages, THE PAGE-BOUNDARY DECODE REQUEST
+  # (property 4) AND THE SAMPLER ROW. 33 = 1 * page_size + 1, so its warm-up
+  # writes exactly page index 0 (positions 0..31) and its single graded query
+  # token is position 32 -- offset 0 of page index 1. Its page list is
+  # DESCENDING ([14, 13]) so a block table read in the wrong order sends that
+  # one token to the page its own prefix occupies, which is a wrong answer
+  # rather than an empty one.
+  #
+  # THE TEXT IS `ragged_gpt_oss`'s SEQUENCE 2, re-tokenized here to exactly 33
+  # ids under gemma-4's tokenizer (with the hand-prepended `<bos>` = 2 that
+  # every prompt in this instance carries, for the reason the top-level
+  # prompt_token_ids block gives). It was chosen there over four alternatives
+  # for precisely the double criterion this position imposes -- a decisive
+  # argmax gap AND a distribution the nucleus points do not collapse -- and this
+  # instance re-screens both on its OWN row rather than inheriting the verdict.
+  #
+  #   "In fact, the periodic table opens with hydrogen and with helium, and the
+  #    element that has atomic number three, the lightest of all the metals, is
+  #    properly called"
+  - stage: decode
+    page_ids: [14, 13]
+    prompt_token_ids: [2, 902, 1707, 236764, 506, 24433, 2633, 19015, 607, 13076,
+      532, 607, 42404, 236764, 532, 506, 3408, 600, 815, 20524, 1548, 1806,
+      236764, 506, 115846, 529, 784, 506, 17257, 236764, 563, 9668, 2760]
+
+# --------------------------------------------------------------------------- #
+# Probe configuration. The class-wide grid, held fixed on purpose -- these are
+# per-CLASS choices, not per-family ones, and holding them fixed is what makes
+# the instances' measured bands comparable. Any point that had to move for this
+# checkpoint says so on its own line.
+# --------------------------------------------------------------------------- #
+#
+# ONE POINT MOVED, AND IT IS NOT THE ONE `core_gemma4` MOVED, BECAUSE THE ROW
+# IS NOT THE SAME ROW. This is the single value in this file that a reader would
+# most reasonably expect the mode axis to leave alone, and it is the one the
+# mode axis changes most.
+#
+# THE SAMPLER ROW IS SEQUENCE 2'S, NOT SEQUENCE 0'S.
+# The freezer's `step_prefill_forward` sets `_prefill_last_logits =
+# self._np(logits)[-1]` off the GRADED forward, and on a mixed batch row -1 is
+# the LAST REQUEST's. So `golden/sampler.npz` -- and every criterion
+# `test_sampler_transforms`, `test_the_sampler_grid_makes_chain_ORDER_
+# observable`, `test_no_sampler_grid_point_cuts_inside_a_tie` and
+# `test_no_two_sampler_grid_points_grade_the_same_thing` apply -- is screened
+# against a 33-token decode request's row, not against the 124-token prompt
+# `core_gemma4` screened. `ragged_llama3`'s own block still says its grid is
+# "byte-identical to core_llama3's, and deliberately so"; it is not (its points
+# 3, 5 and 6 all differ from that instance's), and that sentence is reported as
+# a class-wide documentation defect rather than copied.
+#
+# THE INHERITED GRID IS DEAD ON THIS ROW. `core_gemma4`'s six points,
+# run through `test_the_sampler_grid_makes_chain_ORDER_observable`'s own
+# `_grid_probe` against this instance's frozen row:
+#
+#     point                   keeps    t->p->k    k->p->t   tie margin
+#     {1.0,  0, 1.0}         262144          0          0   (inactive)
+#     {0.7, 50, 1.0}             51          0          0   (inactive)
+#     {1.0,  0, 0.9}              1          0          0   4.020e-02
+#     {0.0,  0, 1.0}         262144          0          0   (inactive)
+#     {1.0, 12, 0.95}             2          0          0   9.772e-03
+#     {0.7,  0, 0.9}              1          0          0   8.109e-02
+#     TOTAL                                  0          0   <- BOTH DEAD
+#
+# THE CAUSE IS THE OPPOSITE OF THE ONE `core_gemma4` HIT, on the same
+# checkpoint, and that is the point worth carrying forward. That instance's row
+# is FLAT (top-1 probability 0.2878, top-5 0.9143) so `top_p 0.85` never reached
+# the `top_k 50` boundary. THIS row is PEAKED -- top-1 0.939512, top-2 0.059890,
+# top-3 0.000250 -- because sequence 2 was chosen for a decisive argmax gap, and
+# a decisive gap IS a concentrated distribution. Every top_p from 0.85 to 0.94
+# keeps ONE token and every one from 0.95 to 0.999 keeps TWO, so no (top_k,
+# top_p) pair at temperature 1.0 can make the two transforms co-active over more
+# than one surviving token. `test_the_sampler_grid_makes_chain_ORDER_observable`
+# names exactly this trade in its own docstring: "ragged's two extra prompts
+# were deliberately re-picked for LARGE argmax margins ... That fix concentrated
+# the distribution and silently disabled this one."
+#
+# TEMPERATURE IS THE WAY OUT, and it is why grid 4 here carries a `temperature`
+# no other instance in this class uses. At T > 1 the 262 144-wide tail inflates,
+# so the FULL distribution's nucleus is wide while the TOP-K-TRUNCATED one is
+# still two tokens -- which makes `k` and `p` genuinely co-active and makes both
+# isolating swaps observable at one point.
+#
+# THE REPLACEMENT WAS CHOSEN AGAINST ALL FOUR CRITERIA AT ONCE, over an
+# 11 x 9 x 15 sweep of (temperature, top_k, top_p) run against THIS instance's
+# own torch bf16 row -- the row the freezer writes, not the JAX one (a sibling
+# arm that screened the JAX row shipped a point landing inside a three-way
+# tie):
+#
+#   1. ORDER-OBSERVABLE ON BOTH PAIRINGS FROM ONE POINT. `{2.0, 20, 0.85}` moves
+#      18 mask cells under `t->p->k` and 1 under `k->p->t`. Both are required --
+#      the check asserts neither total is zero -- and no other point on this
+#      grid contributes to either.
+#   2. NOT CUT INSIDE A TIE, and not marginal in cumulative mass. The margin at
+#      the cut is 9.264e-02, which is 1853x the 5.0e-05 floor and the LARGEST of
+#      any candidate carrying both pairings. The alternatives that keep the
+#      class's usual temperature range are all far worse on exactly this axis:
+#      the nine points at T <= 1.2 that carry both pairings all sit at
+#      `top_p 0.999` with margins from 8.833e-05 to 3.653e-04, i.e. 1.8x to 7.3x
+#      the floor. The class has already paid a full re-freeze for a 5.4e-06
+#      margin, and 1.8x is within an order of that failure.
+#   3. NO bf16 RANK-ADJACENCY COLLISION. Re-run with the row cast through
+#      bfloat16 and back, the point is IDENTICAL on every figure: keeps 2, 18
+#      cells, 1 cell, margin 9.264e-02. That check is not decorative here --
+#      the screen's tie
+#      column is measured on the input row and so cannot see a collision CREATED
+#      by a `T != 1` division, which is precisely this point.
+#   4. NOT A DUPLICATE. Survivor counts across the six points are
+#      262144 / 51 / 1 / 262144 / 2 / 1, and the two 262144s are both the
+#      provably-identity chain, which is the one duplication
+#      `test_no_two_sampler_grid_points_grade_the_same_thing` permits.
+#
+# WHY T = 2.0 AND NOT THE FAMILIAR <= 1.2: it is a measurement, not a taste.
+# 2.0 is the smallest temperature in the sweep at which a point carries both
+# pairings with a tie margin above 1e-02; below it the only survivors are the
+# `top_p 0.999` cuts in criterion 2.
+#
+# The other five points are the class-wide grid unchanged, and all five were
+# re-checked against the same four criteria on THIS row rather than inherited --
+# that re-check is the table above, and it is what showed grid 4 had to move.
+sampler_grid:
+  - {temperature: 1.0, top_k: 0, top_p: 1.0}
+  - {temperature: 0.7, top_k: 50, top_p: 1.0}
+  - {temperature: 1.0, top_k: 0, top_p: 0.9}
+  - {temperature: 0.0, top_k: 0, top_p: 1.0}
+  - {temperature: 2.0, top_k: 20, top_p: 0.85}  # order-observable; see above
+  - {temperature: 0.7, top_k: 0, top_p: 0.9}
+logprobs_top_n: 5
+
+# One JAX generation leg is a prefill plus eight decode steps over a 4.65 B
+# model whose forward carries a 2.35 B-parameter per-layer embedding table.
+generate_timeout_s: 3600
+
+compare_hidden_states: true
+
+# The graded denominator, observed from the oracle grading run. 37 = `core`'s 33
+# plus the four checks that apply only to a mixed batch
+# (`test_ragged_forward_logits`, `test_static_shape_bucketing`,
+# `test_batching_invariance`, `test_batch_composition_battery`).
+graded_checks: 37
+
+# Authoring-host paths. NOT mirrored into meta.json.
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden

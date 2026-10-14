@@ -1,0 +1,31 @@
+# Authoring environment: runs environment/torch_orig and regenerates goldens.
+# Not needed for grading. Install on top of the grade env:
+#     pip install -r requirements/grade.txt -r requirements/authoring.txt
+# torch below is the CPU build; on a GPU host install the matching CUDA wheel instead.
+#     pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+
+torch==2.10.0
+transformers==5.4.0
+tokenizers==0.22.2
+safetensors==0.7.0
+accelerate==1.13.0
+huggingface-hub==1.8.0
+pyyaml==6.0.1
+# torch_orig's data loaders import `datasets`; pandas >= 2.2.3 for numpy 2.x.
+datasets>=3.0
+pandas>=2.2.3
+# Config loading and LoRA.
+omegaconf==2.3.0
+peft==0.18.1
+# Multimodal collators and image processors.
+pillow==11.3.0
+# transformers 5.x image processors need torchvision; 0.25.0 matches torch 2.10.0.
+torchvision==0.25.0
+# Qwen2.5-Omni audio: soundfile decodes WAVs, soxr resamples them to 16 kHz at build time.
+soundfile==0.14.0
+soxr==1.1.0
+
+# Optional, not needed by the current models:
+#   sentencepiece    # slow (spm) tokenizers for some llama/gemma checkpoints
+#   einops           # some custom-code vision towers
+#   timm             # legacy InternVL vision tower

@@ -1,0 +1,54 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Resolved instance config (provenance / regeneration) for sft/phi4.
+# Provenance record for the generated tests/ tree.
+# Paths are relative to this file's directory (the instance test/ dir).
+training_method: sft
+model: phi4
+
+# Determinism + sizes (snapshotted from the authoring template at generation time).
+seed: 42
+batch_size: 1
+max_eval_examples: 2
+loss_trajectory_steps: 3
+generation_max_new_tokens: 8
+compare_hidden_states: true
+# Hard wall-clock budget (seconds) for the repo's OWN training loop, enforced
+# by the grader's test_train_loss_trend. It is a config knob, NOT a
+# frozen artifact: golden-free, so changing it never moves a golden. It catches a port
+# that never terminates (no jit, per-step recompilation, a runaway loop) -- not
+# micro-timing. Uniform 1200s, derived from torch_orig's training time (every torch run
+# is <=~665s; ~1.8x headroom covers a JAX port's one-time XLA compile), NOT from the JAX
+# reference -- a slow reference JAX run is not the oracle and must not inflate the budget.
+train_timeout_s: 1200
+sandbox_timeout_s: 1200
+
+# Conventional layout. shared_config is pulled from
+# the authoring model registry at generation time
+# and snapshotted into golden/meta.json for provenance.
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden
+
+# LlamaFactory's default finetuning_type is LoRA, and torch_orig trains that way;
+# these tests migrate the same LoRA training rather than full finetuning. The base
+# weights are frozen (no gradients / optimizer state) and only low-rank adapters are
+# trained, which keeps both the torch reference and the JAX port on a single GPU.
+# Adapters target all linear projections (rank 8, alpha 16, scale = alpha/rank).
+shared_config_overrides:
+  finetuning_type: lora
+  lora_rank: 8
+  lora_alpha: 16
+  lora_target: all

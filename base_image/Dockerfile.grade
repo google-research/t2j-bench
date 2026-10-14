@@ -1,0 +1,22 @@
+# Torch-free grade image (training tasks), and the base of every training verifier image.
+# A hidden `import torch` in the candidate fails here.
+#   t2j-verifier-base -> t2j-verifier-model:{model} -> t2j-verifier:{method}-{model}
+# Build: base_image/build_base_images.sh --bases-only   (tags it t2j-verifier-base:latest)
+# This base has no model weights or task tests. For standalone grading, use the
+# per-task verifier image and mounts documented in the root README.
+FROM python:3.10-slim
+
+# System libs jaxlib needs at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/t2j
+COPY requirements/grade.txt /opt/t2j/requirements/grade.txt
+RUN pip install --no-cache-dir -r requirements/grade.txt \
+    # Fail the build if torch was pulled in transitively.
+    && ! python -c "import torch" 2>/dev/null && echo "confirmed torch-free"
+
+COPY grade_entrypoint.sh /usr/local/bin/grade
+RUN chmod +x /usr/local/bin/grade
+# No ENTRYPOINT: Harbor keeps the verifier alive with its own command, then runs
+# tests/test.sh.

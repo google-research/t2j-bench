@@ -1,0 +1,14 @@
+# Build context for the per-task images (repo root). build_harbor_images.sh narrows the
+# task lines to the task being built and restores this file afterwards.
+.git
+jobs
+venv*
+# `venv*` doesn't match dotted names like .venv-inference.
+.venv*
+.claude
+node_modules
+**/__pycache__
+**/*.pyc
+*.log
+# The answer key: never part of any image.
+tasks/*/solution

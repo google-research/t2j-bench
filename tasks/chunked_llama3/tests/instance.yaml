@@ -1,0 +1,487 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Per-instance source of truth for tasks/chunked_llama3.
+# the freezer mirrors every value here into
+# golden/meta.json; nothing per-instance is hardcoded in the grader.
+#
+# THE THIRD AND FINAL RUNG OF THE MODE LADDER: core (subset of) ragged (subset
+# of) chunked. Scaffolded from ragged_llama3 -- same
+# checkpoint, same family code, same page pool and the same three-sequence
+# batch shape, with one axis added: `chunk_split_points`, which splits one
+# request's prefill across two engine calls, and the accompanying
+# automatic-prefix-cache (APC) sharing that a chunked engine makes possible
+# between two requests with a byte-identical prefix.
+#
+# The continuation path, the prefix cache, the four chunked/APC probes, the
+# `chunk_boundary` battery axis and the full seven-producer freeze are all in
+# place, and every threshold in this file is measured -- NOTHING here is a
+# placeholder.
+mode: chunked
+model: llama3
+model_name_or_path: meta-llama/Llama-3.2-1B-Instruct
+
+# Graded precision profile. Same as ragged_llama3/core_llama3: two frameworks
+# running independent kernels never agree bit-for-bit in reduced precision, so
+# parity is pinned at two precisions with different tolerances.
+precision_profile: bf16_native
+dtype: bfloat16
+
+# MEASURED, worst of 3 in-container parity runs against
+# THIS instance's own chunked geometry (r0's SECOND prefill call, threading
+# r1's APC-sharing neighbour) -- all three identical, as the class's own
+# "no optimizer, no dropout, no RNG draw" argument predicts.
+fp32_thresholds:
+  # Minimum per-token CENTERED cosine on the fp32 logits (`Golden.fp32_extras`).
+  # MEASURED HERE, worst of 3 (all three identical): min per-token centred
+  # cosine 0.999999999995 -- five orders of magnitude below one float32
+  # quantum (2^-24 = 5.96e-08), i.e. the metric reads SATURATED, the same
+  # "honest port" shape core_llama3/ragged_llama3 both measure. Kept at the
+  # class-wide 0.9999995 (8.39 quanta) rather than tightened toward this
+  # instance's own near-zero reading, for the identical reason ragged_llama3's
+  # instance.yaml gives: the floor is calibrated to separate an honest port
+  # (saturated, reads near 0) from a real, previously-shipped defect (a
+  # bf16-rounded rotary table measured at 61 quanta on ragged_llama3's own
+  # geometry) -- a floor set from THIS instance's own honest reading alone
+  # would be calibrating against float32 rounding noise, not against a
+  # defect boundary.
+  centered_cosine_floor: 0.9999995
+  # `check_array`'s absolute term for every fp32 ARRAY surface: the nine
+  # `reference_units` (12 output arrays between them), `paged_attention/fp32`,
+  # the six sampler grid points and `topn_logprobs` -- 20 arrays in all.
+  #
+  # The class default for this key is `compare.FP32_EXACT_THRESHOLDS.abs_tol` =
+  # 1.0e-3 (`_t2j/compare.py`); five siblings pin it explicitly at 1.0e-4. What
+  # binds is not max |d| but max(|d| - rel_tol*|ref|), 5.7x smaller on this
+  # surface.
+  #
+  # MEASURED HERE, worst of 3 in-container grades of
+  # `solution/ref_jax_repo` -- a real `pytest /tests` session driven
+  # through `fixtures.build_candidate`'s own probes and instrumented at
+  # `test_numeric._assert_array_parity`, NOT a reimplementation of a probe --
+  # ALL THREE BIT-IDENTICAL, and bit-identical again to three further runs taken
+  # in the same session. The binding surface is reference_units/lm_head.out0, an
+  # 11-row 2048-deep fp32 contraction into 128 256 columns (r0's final chunk):
+  #     max |d|                                   3.2425e-05
+  #     smallest abs_tol that still admits it     5.7211e-06   -> 17.5x
+  # Runners-up: qkv_proj.out0 9.0651e-07, gate_up_proj.out0 2.4935e-07,
+  # down_proj.out0 2.4858e-08, paged_attention/fp32 1.8802e-08; the six sampler
+  # grid points and `topn_logprobs` need 0.0 of this key.
+  #
+  # WHAT THE ABS TERM ACTUALLY GRADES, since `rel_tol` carries the rest: at
+  # 1.0e-4 the abs term is the dominant one on 2.68% of lm_head.out0 (the
+  # elements with |ref| < 0.1), and the worst |d| in exactly that region is
+  # 7.9423e-06 -- 12.6x of headroom on the part this key decides. Over the whole
+  # gate, worst |d| / (1e-4 + 1e-3*|ref|) is 0.0756, i.e. 13.2x, and no element
+  # of any fp32 surface exceeds 1.0e-4 on its own.
+  #
+  # DECLARED AT THE SIBLINGS' 1.0e-4, and the agreement is the finding rather
+  # than the convenience. 5.7211e-06 is BIT-IDENTICAL to ragged_llama3's own
+  # independently measured floor for this key and to core_llama3's 5.72e-6 --
+  # on a surface whose SHAPE the mode genuinely moves (lm_head.out0 is 12 rows
+  # on core, 14 on ragged, 11 here). The floor did not move with it, so the mode
+  # axis is inert on this key and adopting the shared value is what THIS
+  # instance's measurement supports, not an inheritance.
+  abs_tol: 1.0e-4
+  #
+  # THE FOUR KEYS BELOW ARE HARD-REQUIRED (`_grade_precheck.py`'s
+  # `check_threshold_extras_name_something_a_check_reads`): `test_behavioral`
+  # reads them with a KeyError-loud `[...]`, not `.get(key, default)`, so an
+  # instance that never calibrates them fails precheck rather than grading at
+  # a silent default. All four gate `Engine.generate`'s free-running fp32
+  # trajectory and `serve.score_continuations`'s held-out scoring -- BOTH
+  # single-sequence on every mode (this instance's own r0, the same request
+  # ragged_llama3/core_llama3 freeze). Chunking only touches r0's PREFILL path
+  # (two `Engine.prefill` calls instead of one); neither probe here goes
+  # through it, so the mode axis has no mechanism to move any of the four.
+  #
+  # MEASURED HERE, against THIS instance's own golden, via
+  # `fixtures.build_candidate` driving `solution/ref_jax_repo` through the
+  # real `cand.generation(fp32=True)` / `cand.held_out()` probes -- not a
+  # hand-rolled reimplementation. Worst of 3 runs, BIT-IDENTICAL across all
+  # three (same two determinism pins as every other floor in this file), and
+  # -- the strongest evidence that the mode axis is inert here -- bit-identical
+  # to ragged_llama3's OWN independently-measured numbers for the same four
+  # quantities, decode-step for decode-step and held-out-prompt for
+  # held-out-prompt:
+  #     logprob_atol            max |d| 3.9816e-05 at step 7      -> 10.0x
+  #     logprob_cumulative_atol |sum d| 1.7782e-04                ->  9.6x
+  #     held_out_logprob_atol   max |d| 7.5579e-05 (prompt 3)     ->  9.9x
+  #     held_out_seq_atol       max |d| 4.0328e-04 (prompt 3)     ->  9.9x
+  # Kept at core_llama3/ragged_llama3's own declared values rather than
+  # tightened toward this instance's floor, for the reason
+  # `logprob_cumulative_atol`'s clause-2-not-derived-from-clause-1 argument
+  # already gives: a floor this close to a shared, re-verified value is
+  # confirmation the probe is unmoved, not room to spend.
+  logprob_atol: 4.0e-04
+  logprob_cumulative_atol: 1.7e-03
+  held_out_logprob_atol: 7.5e-04
+  held_out_seq_atol: 4.0e-03
+
+# The native (bf16) serving tier. Defaults come from
+# `compare.thresholds_for_profile("bf16_native")` (abs 0.1, rel 0.1, cosine
+# 0.98, KL 0.1, argmax_margin 0.0).
+#
+# CALIBRATED BY MEASUREMENT, NOT BY WHAT FAILED. A check that passes says
+# nothing about the distance between the reference and the band, so a threshold
+# that no check happened to fail against can sit at the LOOSEST class default and
+# never be measured at all. Two here did:
+#
+#   `centered_cosine_floor`  absent -> the profile's 0.98, where all five
+#                            siblings measured and declared 0.998 (0.95 on
+#                            core_gpt_oss, for its expert-routing flips). 10x
+#                            looser, on the instance carrying the most graded
+#                            checks in the class -- 41 of 44.
+#   `abs_tol.kv_cache_state` absent -> the tier's 0.1, where the llama3/qwen2
+#                            siblings declare 0.5 (2.0 on core_qwen3, 4.0 on
+#                            core_gpt_oss). 5x TIGHTER, which is a FLAKE RISK
+#                            and not a hole: measured below, 0.1 sits 1.3x over
+#                            this instance's own floor on a bf16-quantised
+#                            quantity whose next increment is 100% away.
+#
+# NOTHING COULD SEE EITHER ABSENCE, and the mechanism is worth stating because
+# it is general: `_harness_checks._required_extras` derives its require-list from
+# the source and deliberately excludes any key whose reader has a documented
+# fallback, and `test_numeric._centered_floor` falls back to the band's own
+# `cosine_floor`. `_grade_precheck.py --harness-only` was green 6/6 on this
+# instance throughout. An allow-list cannot see an absence and a per-instance
+# gate cannot see a class-wide asymmetry;
+# the harness's symmetry test is the gate that can, and it
+# is the first in this class that compares instances to EACH OTHER rather than
+# each instance to its own declarations.
+#
+# ALL FOUR OVERRIDES BELOW NOW CARRY THIS INSTANCE'S OWN MEASURED FLOOR, its
+# chosen value and the ratio between them -- whether or not a check ever failed
+# against the default.
+native_thresholds:
+  # POSITION-level decisiveness for `test_prefill_logits` /
+  # `test_chunk_boundary_battery` (the class default, 0.0, makes every
+  # position decisive -- a genuine bf16 near-tie then fails a correct port).
+  #
+  # MEASURED HERE, worst of 3 (identical across all 3), via the real
+  # `cand.prefill(fp32=False)` probe against this instance's own graded
+  # 11-row mixed batch: the reference-as-candidate disagrees with the golden's
+  # argmax at 2 of the 11 rows, at golden top1-top2 gaps 0.0 (a genuine bf16
+  # tie) and 0.125 -- BIT-IDENTICAL to ragged_llama3's own two measured gaps,
+  # and at the same two ABSOLUTE prompt positions (7 and 9) once r0's local
+  # row index is mapped back through `query_start_loc`: this is core's own
+  # 12-token prompt's own near-tie, reproduced rather than a new one.
+  #     floor 0.125   declared 0.1875   -> 1.50x, one bf16 grid step
+  # KEPT AT core_llama3/ragged_llama3's shared 0.1875 rather than re-derived,
+  # for the same reason `logprob_atol` above is: a floor this close to the
+  # shared value, on the SAME two positions, is confirmation the value
+  # transfers, not room to spend.
+  argmax_margin: 0.1875
+  # Minimum per-token CENTERED cosine, native tier. Served through
+  # `Golden.native_extras`. ON THIS INSTANCE IT GATES 41 SURFACES: the frozen
+  # prefill logits, each of the three ragged per-request slices, the eight decode
+  # steps, the chunked prefill, both `batch_composition` variants, all four
+  # `chunk_boundary` variants, the four self-comparisons (batching, chunking,
+  # prefix-cache, and both legs of decode/prefill consistency) and all 17 hidden
+  # states. ONE floor over all of them -- this instance names no per-surface
+  # override the way core_qwen2 does.
+  #
+  # AN ABSENT VALUE FALLS BACK TO the profile's 0.98, 10x looser than every
+  # sibling. See this block's header for why no gate saw it.
+  #
+  # MEASURED HERE, worst of 3 in-container grades, ALL THREE
+  # BIT-IDENTICAL (and identical again to three further runs in the same
+  # session), through the real probes at `test_numeric`'s own two gates rather
+  # than a reimplementation. Ratios are (1 - 0.998) / (1 - measured):
+  #     batch_composition battery, BOTH variants  0.99969119  ->  6.48x
+  #     hidden_16 (post-final-norm)               0.99971128  ->  6.93x
+  #     prefill_logits / ragged request_2         0.99979627  ->  9.82x
+  #     hidden_15                                 0.99986082  -> 14.37x
+  #     ragged_forward_logits/request_0           0.99988806  -> 17.87x
+  #     test_batching_invariance                  0.99989212  -> 18.54x
+  #     decode steps, worst (step 1)              0.99989927  -> 19.85x
+  #   ...and the CHUNKED axis's own four surfaces, every one of them QUIETER
+  #   than the surface that binds:
+  #     chunked_prefill_logits                    0.99990946  -> 22.09x
+  #     chunk_boundary battery, worst (interior)  0.99990946  -> 22.09x
+  #     test_decode_prefill_consistency[near]     0.99993402  -> 30.31x
+  #     test_chunking_invariance                  0.99994594  -> 36.99x
+  #     test_prefix_cache_invariance              0.99996358  -> 54.92x
+  #   (best of the 41: hidden_0 at 0.99999988 -- one float32 quantum, saturated)
+  #
+  # SO THE FLOOR IS 6.48x AND THE MODE DID NOT SET IT. The binding surface is a
+  # RAGGED-axis one this rung inherits, and 0.99969119 is BIT-IDENTICAL to
+  # ragged_llama3's own independently measured worst reading for this key -- as
+  # is hidden_16's 0.99971128, its second tightest. The four surfaces that exist
+  # only because the mode is `chunked` sit 3.4x to 8.5x further from the floor
+  # than the one that binds. THAT AGREEMENT IS THE CONFIRMATION that the mode
+  # axis is inert on this key, and it is what makes adopting the siblings' 0.998
+  # this instance's own measured answer rather than an inheritance.
+  #
+  # 6.48x IS THINNER THAN core_llama3's 8.7x ON THE SAME KEY, stated here rather
+  # than left to be derived. core has neither a battery axis nor a ragged
+  # composition, so its worst surface is its own hidden_16; ragged_llama3 records
+  # the same 6.5x from the same battery row. Nothing in that argues for widening:
+  # the 0.98 this replaces sits 64.76x from the measurement, which is close to
+  # unfalsifiable on this surface, and 0.998 clears all 41 surfaces by >= 6.48x.
+  #
+  # The RAW `cosine_floor` stays at the profile's 0.98 -- it is a class-wide
+  # decision, not this instance's. Worst raw cosine measured here is 0.99972308
+  # (ragged request_2), 72.2x inside it.
+  centered_cosine_floor: 0.998
+  # PER-SURFACE abs_tol for the post-prefill cache tensor (`test_kv_cache_write`):
+  # [16, 12, 8, 2, 8, 64], 1 572 864 elements, peak 17.125.
+  #
+  # AN ABSENT VALUE FALLS BACK TO the tier's 0.1 -- 5x
+  # TIGHTER than the 0.5 the llama3/qwen2 siblings declare. TIGHTER IS NOT
+  # AUTOMATICALLY SAFE: a band below the instance's own noise fails a CORRECT
+  # port, and the reason this key is per-surface at all is that the tier default
+  # is calibrated for the isolated attention op's scale (peak 0.586 here) while
+  # this tensor is 29x wider.
+  #
+  # MEASURED HERE, worst of 3 in-container grades (all three
+  # bit-identical):
+  #     max |d|                                  0.125   (one bf16 ULP at |ref| ~ 9)
+  #     smallest abs_tol that still admits it    0.0756          -> 6.61x
+  #     worst |d| / (0.5 + 0.1*|ref|)            0.1656          -> 6.04x
+  #     elements over the declared 0.5                0  of 1 572 864
+  # AND AT THE 0.1 FALLBACK THIS REPLACES, the same three readings are:
+  #     0.1 / 0.0756                                             -> 1.32x
+  #     worst |d| / (0.1 + 0.1*|ref|)            0.7664          -> 1.31x
+  #     elements over 0.1                            16  of 1 572 864, admitted
+  #                                                  by the rel term alone
+  # 1.3x IS NOT HEADROOM ON A QUANTISED QUANTITY. Every disagreement on this
+  # surface is a bf16 ULP, so the next value a legitimately noisier port can
+  # produce at a given element is not 30% away, it is 100% away. The reference
+  # passes at 0.1 today; a correct port one ULP noisier at any of those 16
+  # low-|ref| elements does not.
+  #
+  # DECLARED AT THE SIBLINGS' 0.5, ratio 6.61x. Both floor readings are
+  # BIT-IDENTICAL to ragged_llama3's own (0.0756, and 0.1656 against the same
+  # 0.5), which is the confirmation the mode axis is inert here: this cache
+  # carries r0's TWO chunk writes and the page r1 borrows through the prefix
+  # cache as well as the warm-up's, and none of that moved either number. The
+  # abs term is the dominant one on 99.68% of the tensor (everything under
+  # |ref| = 5), so this key -- not `rel_tol` -- is what grades it.
+  abs_tol.kv_cache_state: 0.5
+  # PER-SURFACE abs_tol override for the residual stream (`test_hidden_states`).
+  # The tier default (0.1) is calibrated for the isolated attention op's own
+  # scale; the residual stream is a different scale entirely.
+  #
+  # MEASURED HERE, worst of 3 (identical across all 3), via the real
+  # `cand.prefill(fp32=False)` probe, all 17 layers of this instance's own
+  # hidden-state trace: the post-final-norm layer (`hidden_16`) is both the peak
+  # (17.625) and the worst elementwise diff (0.21875) -- 2.2x over the tier
+  # default 0.1, which is why the check failed before this override existed.
+  # core_llama3/ragged_llama3 calibrated this same key to 1.0 from their OWN
+  # (larger-scale, 14-row) hidden-state traces; 0.21875 sits 4.6x under that
+  # shared floor, so it is kept at the shared value rather than tightened toward
+  # this instance's smaller reading, for the same reason the FP32
+  # `centered_cosine_floor` gives (that block, not the native one added below
+  # it): a floor is calibrated to separate an honest port from a real defect,
+  # and this instance's own honest reading is not that defect's anchor.
+  #
+  # TWO PROPERTIES OF THIS TRACE:
+  #   * THE TRACE IS 11 ROWS. Each layer measures 22 528 elements = 11 x 2048,
+  #     i.e. the whole graded mixed batch -- r0's 7-token final chunk PLUS r1's
+  #     3 rows and r2's 1 -- the same 11 rows `prefill_logits` grades.
+  #   * WHAT BINDS IS THE RATIO OVER THE FLOOR, NOT max |d| / declared:
+  #     `check_array` is `|d| <= abs_tol + rel_tol*|ref|`, so what binds is
+  #     max(|d| - 0.1*|ref|), measured here at 0.126007 on hidden_16 -- ratio
+  #     1.0 / 0.126007 = 7.94x, and worst |d| / (1.0 + 0.1*|ref|) = 0.1628, i.e.
+  #     6.14x on the gate as a whole. Bit-identical to ragged_llama3's own 0.1260
+  #     and within 0.5% of core_llama3's 0.1266.
+  abs_tol.hidden_states: 1.0
+  # SEQUENCE-level decisiveness for `test_greedy_sequence`, also HARD-REQUIRED
+  # (see the fp32 block above for the precheck that demands it) and also read
+  # only inside the branch `if not np.array_equal(got, want)` -- i.e. it is
+  # never evaluated at all on a correct port, whose native tokens match the
+  # golden's bit for bit.
+  #
+  # MEASURED HERE, worst of 3 (identical across all 3), via the same
+  # real `cand.generation()` probe: the oracle's 8 native tokens
+  # ([10057, 374, 20437, 13, 578, 6864, 315, 15704]) equal the golden's
+  # exactly, so the margin branch is provably inert on the honest port, and
+  # `golden.decode_margins` (this instance's own r0, DERIVED per-generated-step
+  # from `prefill_forward`/`decode_step.npz`) is
+  # [4.0, 5.125, 5.375, 1.625, 0.5, 2.125, 5.375, 0.5] -- bit-identical to
+  # ragged_llama3's own measured array for the same request, again because
+  # this probe is r0 alone and chunking never reaches it. Smallest margin 0.5,
+  # 4.0x above the declared floor.
+  #
+  # KEPT AT core_llama3/ragged_llama3's shared 0.125 rather than re-derived
+  # from this instance's own (inert) reading: the value's whole justification
+  # is separating a genuine divergence from a golden near-tie, which this
+  # instance cannot exercise on the reference any more than its siblings
+  # could -- see `test_greedy_sequence`'s own docstring for where that
+  # separation was proven falsifiable in both directions.
+  decisive_margin: 0.125
+  #
+  # THE TIER DEFAULTS NOTHING ABOVE OVERRIDES, measured on this instance in the
+  # same three runs -- recorded so that "the band" means the whole band and so
+  # that the next reader does not have to re-derive which of the five are still
+  # the profile's:
+  #     abs_tol       0.1   paged_attention/native needs 0.0 of it (max |d|
+  #                         7.63e-06 at peak 0.586); worst |d| / (0.1 + 0.1|ref|)
+  #                         = 7.62e-05, i.e. 13 100x. The one native array
+  #                         surface with no override, and the reason the other
+  #                         two need theirs.
+  #     cosine_floor  0.98  worst RAW cosine 0.99972308 (ragged request_2)
+  #                         -> 72.2x. Class-wide; see `centered_cosine_floor`.
+  #     max_kl        0.1   NOT re-measured in this round. The instrumentation
+  #                         used here records the two clauses it was written for
+  #                         -- the centred cosine and the elementwise band -- and
+  #                         the KL clause rides `compare.check_logits_strict`'s
+  #                         own metrics, which this round did not capture. Said
+  #                         plainly rather than filled in from a sibling: it is
+  #                         the one number in this block with no measurement of
+  #                         this instance's own behind it.
+  #     rel_tol       0.1   uncalibrated on both tiers and binding on the wide
+  #                         surfaces -- a recorded class-wide limit, not an
+  #                         instance choice.
+
+seed: 42
+
+# ===========================================================================
+# Paged KV geometry -- byte-identical to ragged_llama3's. Chunking
+# is an axis ON TOP OF the ragged batch, not a replacement for it: three
+# sequences remains the smallest batch that is genuinely mixed, and the two
+# RunConfig.__post_init__ relations ragged_llama3 derives these from are
+# unchanged --
+#   pages_per_seq * page_size >= max_model_len   ->  4 * 8 = 32 >= 32
+#   num_pages >= max_num_seqs * pages_per_seq    ->  12 >= 3 * 4
+# ===========================================================================
+page_size: 8
+num_pages: 12
+max_num_seqs: 3
+pages_per_seq: 4
+max_model_len: 32
+num_decode_steps: 8
+
+# THE FROZEN PAGE ASSIGNMENT for the request that DECODES, i.e. r0
+# (ragged_llama3's own comment on the same key). r0 is ragged_llama3's r0
+# with chunking added, so this mirrors ragged_llama3's top-level `page_ids` /
+# `prompt_len` / `prompt_token_ids` byte-for-byte: the generation, decode-step,
+# sampler, serve and held-out probes are single-sequence on every mode and
+# read these top-level keys, not `sequences[0]`.
+#
+# `ceil((prompt_len + num_decode_steps) / page_size)` = `ceil(20 / 8)` = 3,
+# matching the 3 ids below -- 2 pages for the 12 prefill tokens (see
+# `chunk_split_points` below) plus 1 for the 8-step decode continuation that
+# follows them. `sequences[0]` (r0, below) restates this list exactly, which
+# is also `validate_sequences`'s rule for whichever entry is sequence 0.
+page_ids: [2, 0, 3]
+
+# The K sweep. FOUR legs -- three fitting points once
+# `fit_step_time` drops call 1, the minimum at which it has a degree of freedom
+# to see a bad call in. `num_decode_steps` (8) MUST be one of these four:
+# `perf_probe` samples `tokens` -- the work gate's subject -- only on that leg,
+# and the gate silently gets `None` if the coupling breaks.
+# Feasibility, sized off the TOP-LEVEL `prompt_len` / `page_size` above --
+# mirroring ragged_llama3's identical geometry -- since `perf_probe`
+# runs a single-sequence `Engine.generate` over `self.prompt_ids`, sequence 0,
+# not `chunk_split_points` or the other two requests. The sweep's own page
+# assignment is NOT frozen -- `perf_probe` drives the candidate's own allocator
+# (USE_FROZEN_ALLOCATION["perf"] = False) -- so the only thing that has to fit
+# is the COUNT: ceil((prompt_len 12 + 16) / page_size 8) = ceil(28/8) = 4 <=
+# pages_per_seq (4), no headroom, and 12 + 16 = 28 <= max_model_len (32).
+# the harness enforces both, per instance.
+perf_k_values: [2, 4, 8, 16]
+
+prompt_len: 12
+prompt_token_ids: [128000, 791, 6864, 315, 9822, 374, 12366, 11, 323, 279, 6864, 315]
+
+# THE CHUNKED AXIS. Split at 5, which is OFF a page boundary (page_size is 8),
+# so the canonical scenario itself exercises a partial-page write: chunk 1
+# fills slots 0-4 of page 0 and chunk 2 resumes at slot 5. A page-aligned split
+# would leave the hardest case to the battery alone.
+chunk_split_points: [5]
+
+# ===========================================================================
+# THE THREE REQUESTS. Each `page_ids` list below is validated
+# against ragged_llama3/tests/instance.yaml's rules (exact count, no repeats,
+# no negatives, no `page_ids[i] == i`, no cross-request overlap):
+#   r0 owns pages {2, 0, 3}   sequence 0 -- restates the top-level list above,
+#                             3 = ceil((12 prompt + 8 decode) / 8)
+#   r1 owns page  {5}         1 own page; its OTHER page is r0's page_ids[0]
+#                             (physical page 2), on loan -- see its comment
+#                             below. 5, not 3: page 3 is r0's.
+#   r2 owns pages {7, 6}      2 = ceil(9 tokens / 8), ragged_llama3's own count
+# {0, 2, 3, 5, 6, 7} are pairwise disjoint (6 of the 12-page pool) and every
+# id is in range.
+sequences:
+  # r0 is the CHUNKED request: 12 tokens prefilled in two calls (see
+  # `chunk_split_points` above), then 8 decode steps -- the SAME request the
+  # top-level `page_ids` / `prompt_len` / `prompt_token_ids` above describe,
+  # restated here because `sequences[0]` must equal them exactly. The same 12
+  # prompt tokens ragged_llama3 and core_llama3 freeze, so this instance's
+  # single-sequence surfaces are comparable along the mode axis and nothing
+  # else.
+  - {request_id: 0, stage: prefill_chunked, page_ids: [2, 0, 3],
+     prompt_token_ids: [128000, 791, 6864, 315, 9822, 374, 12366, 11, 323, 279, 6864, 315]}
+  # r1's first page is r0's page 0, lent by the prefix cache rather than
+  # allocated: its first 8 tokens are byte-identical to r0's. Only a FULL page
+  # can be shared, which is why the shared prefix is 8 and not 5. The freezer
+  # resolves this to r0's page_ids[0] when it builds r1's block-table row;
+  # page_ids below lists only what r1 owns.
+  - request_id: 1
+    stage: prefill
+    shares_prefix_with: 0
+    shared_prefix_len: 8
+    page_ids: [5]
+    prompt_token_ids: [128000, 791, 6864, 315, 9822, 374, 12366, 11, 1115, 374, 264]
+  # r2 is ragged_llama3's third request, unchanged: a decode-stage sequence
+  # whose 9 tokens (> page_size) put its decode token on the FIRST slot of its
+  # second page, and whose page list is reversed so a block-table read in the
+  # wrong order is visible.
+  - {request_id: 2, stage: decode, page_ids: [7, 6],
+     prompt_token_ids: [128000, 791, 4062, 14198, 39935, 35308, 927, 279, 16053]}
+
+# SCREENED against THIS instance's own graded row -- r0's final
+# chunk, frozen for the first time by this task. Started from ragged_llama3's
+# own 6-row grid (the informed starting point, not a guess) and re-run through
+# the same two guards (`pytest -k "sampler_grid or tie"`) against
+# THIS instance's own `golden/sampler.npz`; the measured margins justify keeping
+# it unchanged.
+sampler_grid:
+  - {temperature: 1.0, top_k: 0, top_p: 1.0}
+  - {temperature: 0.7, top_k: 50, top_p: 1.0}
+  - {temperature: 1.0, top_k: 0, top_p: 0.985}
+  - {temperature: 0.0, top_k: 0, top_p: 1.0}
+  - {temperature: 1.2, top_k: 50, top_p: 0.985}  # top-k AND top-p co-active
+  - {temperature: 0.8, top_k: 0, top_p: 0.95}    # temperature AND top-p co-active
+logprobs_top_n: 5
+
+# Hard wall-clock budget (seconds) for the whole candidate sandbox -- see
+# ragged_llama3's instance.yaml for the full explanation of what this bounds
+# and why. Kept at ragged_llama3's measured value pending this instance's own
+# in-container timing: a chunked scenario does strictly more work
+# per request (two prefill calls instead of one for r0) so 900 s is not
+# expected to tighten, only possibly need raising.
+generate_timeout_s: 900
+
+compare_hidden_states: true
+
+# THE GRADED DENOMINATOR: ragged_llama3's 37 plus the four checks
+# `conftest._APPLICABLE` gates on `has_chunked` (none of which has ever
+# executed on any shipped instance before this one):
+#   test_chunked_prefill_logits     has_chunked
+#   test_chunking_invariance        has_chunked
+#   test_prefix_cache_invariance    has_prefix_cache (== has_chunked here)
+#   test_chunk_boundary_battery     has_chunked and has_battery_chunk_boundary
+# The fourth also needs a frozen `battery/chunk_boundary/` axis, which this task
+# provides; declared as 41 now because `graded_checks` states what this mode's
+# suite collects once the goldens exist, not what an empty golden/ collects
+# today (see INSTANCE_KEYS_NOT_MIRRORED: this key is a fact about the tests
+# tree, not about the frozen arrays, and the oracle grading run is what reads it).
+graded_checks: 41
+
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden

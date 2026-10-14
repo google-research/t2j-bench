@@ -1,0 +1,19 @@
+# Weight image: the agent base plus one model's weights at /data/{repo_id}, shared by
+# every task on that model. Task code reads them from there and never downloads.
+#   t2j-agent-base -> t2j-model:{model} -> t2j-agent:{method}-{model}
+# Build: base_image/build_base_images.sh <model>
+FROM t2j-agent-base:latest
+
+ARG MODEL_REPO
+ARG MODEL_REVISION=main
+
+# Gated repos need an HF token, passed as a BuildKit secret so it never lands in a layer
+# (optional for ungated models). One RUN so the HF download cache isn't kept in the image.
+COPY prepare_model.py /tmp/prepare_model.py
+RUN --mount=type=secret,id=hf_token \
+    test -n "$MODEL_REPO" || { echo "MODEL_REPO build-arg is required" >&2; exit 1; } \
+    && HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+       python /tmp/prepare_model.py --repo "$MODEL_REPO" --revision "$MODEL_REVISION" --out /data \
+    && rm -rf /tmp/prepare_model.py /root/.cache/huggingface
+
+WORKDIR /workspace

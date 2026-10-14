@@ -1,6 +1,18 @@
 # Project
 .artifacts
 .attempt_docker
+results
+jobs
+.golden*
+# Harbor output dirs under any $JOBS_DIR name. Agent transcripts may contain credentials.
+jobs-*/
+jobs_*/
+
+# Grade outputs (regenerated on every run).
+tasks/*/tests/eval_summary.json
+tasks/*/tests/.grade/
+dashboard.json
+dashboard.md
 
 # Python
 __pycache__/
@@ -52,24 +64,9 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
-.pytest_cache/
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+# Build logs
+build_logs
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -95,14 +92,12 @@ docs/_build/
 site/
 
 # Misc
-.DS_Store
 Thumbs.db
 *.bak
 *.tmp
 *.temp
 
-# AI Coding Tools - Project-specific configs
-# Developers should symlink or copy AGENTS.md and add their own overrides locally
+# AI coding tool configs
 .adk/
 .claude/
 CLAUDE.md
@@ -118,3 +113,11 @@ CLAUDE.md
 .rooignore
 .bolt/
 .v0/
+
+# Agent scratch workspace
+.superpowers/
+
+# Authoring venv for the inference tasks (newer jax/flax)
+.venv-inference/
+
+out/

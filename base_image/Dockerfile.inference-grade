@@ -1,0 +1,19 @@
+# Torch-free grade image (inference tasks), and the base of every inference verifier
+# image. Separate from Dockerfile.grade because this class needs jax 0.11.0 / flax 0.12.8
+# while the training goldens are frozen against jax 0.6.2 / flax 0.10.7.
+# python:3.12 because jaxlib 0.11.0 has no wheels for older Pythons.
+# Build: base_image/build_inference_bases.sh
+FROM python:3.12-slim
+
+# System libs jaxlib needs at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/t2j
+COPY requirements/inference-grade.txt /opt/t2j/requirements/inference-grade.txt
+RUN pip install --no-cache-dir -r requirements/inference-grade.txt \
+    # Fail the build if torch was pulled in transitively.
+    && ! python -c "import torch" 2>/dev/null && echo "confirmed torch-free"
+
+# No ENTRYPOINT: Harbor keeps the verifier alive with its own command, then runs
+# tests/test.sh.

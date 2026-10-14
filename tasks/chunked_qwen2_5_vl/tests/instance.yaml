@@ -1,0 +1,1306 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Per-instance source of truth for tasks/chunked_qwen2_5_vl.
+# the freezer mirrors every value here into
+# golden/meta.json; nothing per-instance is hardcoded in the grader.
+#
+# THIS IS THE `chunked` x `qwen2_5_vl` CELL -- the fifteenth instance, and the
+# last cell of the five-family grid. It is a TRANSPLANT and not an authoring
+# exercise: the family column (modeling/config/vision/loader/serve, the prompt,
+# the image fixture, the thresholds' SHAPE) comes from `core_qwen2_5_vl` and the
+# mode column (engine/paged/metadata, the geometry, the split points, the mixed
+# batch) from `chunked_llama3`. Every value below is one parent's, held fixed,
+# or a number this cell had to measure for itself -- and each of the latter says
+# which.
+#
+# THE ONE QUESTION THIS CELL ASKS THAT NO OTHER DOES, answered by measurement
+# before a line of it was written: DOES A CHUNK BOUNDARY COMPOSE WITH A VISION
+# TOWER? Yes, and the constraint is exactly one sentence long.
+#
+#   MEASURED, both frameworks, the real Qwen2.5-VL-3B-Instruct
+#   checkpoint, float32, on the transplanted reference (core_qwen2_5_vl's family
+#   column + chunked_llama3's engine/paged/metadata), against an UNCHUNKED
+#   prefill of the same 11-token prompt as the control:
+#
+#     split   in-image   JAX |dlogits[-1]|   torch |dlogits[-1]|   argmax
+#         5      no            4.959e-05          0.000e+00        match
+#         6      no            4.959e-05          0.000e+00        match
+#         7      no            4.959e-05          9.537e-06        match
+#         8      no            4.959e-05          1.419e-05        match
+#         9      no            4.387e-05          0.000e+00        match
+#        10      no            4.101e-05          1.049e-05        match
+#      [6, 9]    no            4.387e-05          0.000e+00        match   (3 chunks)
+#
+#   ...and the CROSS-FRAMEWORK figure at every one of those boundaries is
+#   |dlogits[-1]| <= 7.44e-05 / |dKV| <= 1.30e-04, against an UNCHUNKED
+#   cross-framework baseline of 8.39e-05 / 1.13e-04 on the identical pair. So
+#   chunking adds no divergence: the chunked disagreement is the unchunked
+#   disagreement.
+#
+#   THE GATE IS SENSITIVE AND THAT IS THE POSITIVE CONTROL, not an assumption:
+#   the same two-chunk prefill with `pixel_values` WITHHELD moves the last row by
+#   7.689 and FLIPS the argmax, on both frameworks, to the same three decimal
+#   places. A 5e-05 agreement over a 151936-wide vocabulary is therefore a
+#   measurement and not a vacuous pass.
+#
+# AND THE CONSTRAINT, which is what `chunk_split_points` below is chosen against:
+# AN IMAGE'S `<|image_pad|>` RUN MUST LIE ENTIRELY INSIDE ONE CHUNK. It is
+# already refused BY NAME, identically on both frameworks, by
+# `modeling.py::get_input_embeddings`'s count check -- MEASURED at every split
+# point of this prompt, whose run is [1, 5):
+#     split 1  -> "carries 0 <|image_pad|> ... but the tower produced 4"
+#     split 2  -> "carries 1 ... produced 4"
+#     split 3  -> "carries 2 ... produced 4"
+#     split 4  -> "carries 3 ... produced 4"
+# The counts are exact and the two frameworks' messages are identical. Note the
+# refusal is about the SPLIT, not about the prompt, while the message's remedy
+# clause ("check that the prompt was built from the SAME image_grid_thw") names
+# the prompt -- a class-wide diagnosability defect in a FAMILY-column file shared
+# with `core_qwen2_5_vl` and `ragged_qwen2_5_vl`. Reported, deliberately not
+# fixed here: a one-instance edit to a transplanted family file would make the
+# column diverge for a message.
+#
+# Two corollaries, both measured, both load-bearing for the freeze:
+#   * the boundary may equally fall BEFORE the run -- split 1 with the image
+#     handed to the SECOND chunk agrees with the unchunked prefill at 9.680e-05
+#     (JAX) / 2.575e-05 (torch). The rule is "not inside", not "after".
+#   * `pixel_values` goes to EXACTLY ONE chunk and `image_grid_thw` to EVERY
+#     chunk. Passing the pixels twice raises the same count check; withholding
+#     the grid from a continuation chunk raises "the prompt has 1 run(s) of
+#     <|image_pad|> but 0 grid(s) were supplied" out of the POSITIONS builder.
+#
+# WHAT IS MEASURED HERE AND WHAT IS NOT -- read this before trusting a number.
+#   MEASURED ON `environment/torch_orig` ITSELF, against the real qwen2_5_vl
+#   checkpoint -- its `ModelConfig.from_hf`, its `load_weights`,
+#   its `get_mrope_input_positions`, its `BlockPool`/`AttentionMetadata`, the
+#   frozen page assignment, the frozen image fixture, bfloat16, CPU:
+#     * `prompt_token_ids` and `prompt_len` (the shipped `tokenizer.json`, via
+#       `tokenizers.Tokenizer.from_file` -- the object `model/loader.py`'s
+#       `load_tokenizer` builds), plus the eight RAW greedy decode margins and the
+#       prefill row's top-1 probability that motivate the prompt CHOICE, over
+#       twenty screened candidates. See the prompt block, including two
+#       alternatives and why both were rejected, and the two method faults that
+#       would make the margins wrong.
+#     * the eleven prefill-row decisiveness gaps (see `argmax_margin`).
+#     * `sampler_grid` -- all three of its top_p values, against the class's own
+#       three screening predicates, RE-SCREENED against the canonical row once
+#       the freezer could produce one. See that block: two values survived
+#       unchanged and one had to move.
+#     * the geometry arithmetic (page count, context fit, perf feasibility).
+#     * `graded_checks` -- collected, not predicted; see its own comment.
+#   THE CANONICAL PREFILL ROW EXISTS. Without `Engine.POSITIONS_HOOK` /
+#   `Engine.INPUTS_HOOK` the freezer would build rank-1 `input_positions` and
+#   pass no `pixel_values`, which the reference's rope refuses by name; with the
+#   hooks the freezer runs end to end, and `golden/sampler.npz::logits` is
+#   bit-identical to `golden/prefill_forward.npz::logits[-1]`: argmax 13753,
+#   top-1 0.164431. Every figure below that names a logit row is that row.
+#   MEASURED AGAINST `solution/ref_jax_repo`, in
+#   `t2j-inference-verifier:core-qwen2-5-vl` on the pinned H100 grading SKU,
+#   three processes on three GPUs, every statistic bit-identical:
+#     * BOTH threshold blocks. This checkpoint's own floors replace core_qwen3's
+#       carried-over values, each with the ratio it clears by. All eleven keys
+#       are measured, and three of them had to MOVE off the
+#       carried-over number (`argmax_margin`, `centered_cosine_floor`,
+#       `abs_tol.hidden_states`) with one key added
+#       (`centered_cosine_floor.hidden_states`). Read each key's own block for
+#       the floor, the value and the ratio.
+#   MEASURED AND DELIBERATELY NOT DECLARED:
+#     * `perf_thresholds.delta`. `golden/perf.json` IS frozen (ref_step_ms
+#       109.4445, on the pinned SKU) and a TEN-TRIAL precision study WAS run
+#       against it. `delta = p99(ratio) - 1` comes out at 0.432, i.e. a gate
+#       that would admit a port 43% slower than the reference, off a
+#       same-day corpus. That is not a speed gate, so `perf_graded` is left
+#       absent and `test_decode_speed` stays deselected. See the
+#       `perf_k_values` block for the distribution and the reasoning, and
+#       `graded_checks` for why 39 is the honest count.
+mode: chunked
+model: qwen2_5_vl
+model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+# THE FIRST INSTANCE IN THE CLASS TO SET THIS. `conftest._golden_facts` has read
+# `multimodal` off meta since slice 1 and nothing had ever set it. The allow-list
+# entry that lets the freezer mirror the key rather than refuse it is
+# the freezer's `INSTANCE_KEYS["multimodal"]`, which now
+# names this instance. CITED BY KEY AND NOT BY LINE NUMBER, deliberately:
+# line numbers drift as siblings edit the file, so a key name is the stable
+# reference.
+#
+# IT IS NOT SNIFFED FROM THE FROZEN ARRAYS, deliberately: it is a fact about the
+# MODEL, which the freezer knows, and a key-name heuristic over the batch would
+# only guess (see that file's own comment beside `is_moe`).
+#
+# ASYMMETRY WAIVER REQUIRED, AND IT SHIPS WITH THIS KEY, NOT BEFORE IT.
+# the harness's symmetry test demands every top-level key
+# be present on ALL instances unless `_WAIVERS` scopes it, so a `multimodal` on
+# one instance FAILS that test without a `_by_model("qwen2_5_vl")` entry -- and
+# `test_no_waiver_is_dead` in the same module fails a waiver no instance
+# declares, so the two changes are one commit. That module is in NEITHER
+# the automated inference checks NOR CI; run it by hand.
+multimodal: true
+
+# Graded precision profile. Two frameworks running independent kernels never
+# agree bit-for-bit in reduced precision, so parity is pinned at two precisions
+# with different tolerances.
+precision_profile: bf16_native
+dtype: bfloat16
+
+# Every instance in this class uses 42, and the image-preprocess freezer
+# restates it as `DEFAULT_SEED` so the frozen image fixture is a function of the
+# instance rather than of whoever ran the generator. If this moves, that moves
+# and the fixture is regenerated.
+seed: 42
+
+# Paged KV geometry. `page_size`, `pages_per_seq` and `max_model_len` are
+# core_llama3's, unchanged on both axes. `num_pages` and `max_num_seqs` are the
+# MODE column's, byte-identical to chunked_llama3 / chunked_qwen2 /
+# chunked_qwen3: a mixed batch of three requests needs three concurrent slots and
+# a pool big enough for their disjoint page sets plus the loan below.
+page_size: 8
+num_pages: 12
+max_num_seqs: 3
+pages_per_seq: 4
+max_model_len: 32
+
+# THE FROZEN PAGE ASSIGNMENT -- deliberately NOT the identity.
+# the freezer requires exactly
+# ceil((prompt_len + num_decode_steps) / page_size) ids -- at this geometry,
+# ceil((11 + 8) / 8) = 3, not `pages_per_seq` (4) -- with none repeated, none
+# at page_ids[i] == i, and every one in [0, num_pages). core_llama3's [2, 0, 3]
+# satisfies all four on this exact geometry, and this instance's prompt (11
+# tokens, the same count core_qwen2 and core_qwen3 land on) does not move the
+# page count, so there is no reason to pick a different list.
+#
+# THE VISION MARKERS DO NOT CHANGE THIS ARITHMETIC, which is worth saying once
+# because it is the first thing a reader of a multimodal instance doubts. The
+# four `<|image_pad|>` ids are ORDINARY POSITIONS in the KV cache: the tower
+# replaces their embeddings, it does not add or remove sequence slots. 11 prompt
+# positions is 11 pages' worth of slots whatever produced the embeddings.
+page_ids: [2, 0, 3]
+
+# The K sweep. FOUR legs -- three fitting points once `fit_step_time`
+# drops call 1, the minimum at which it has a degree of freedom to see a bad call
+# in. `num_decode_steps` (8) MUST be one of these four: `perf_probe` samples
+# `tokens` -- the work gate's subject -- only on that leg, and the gate silently
+# gets `None` if the coupling breaks.
+# Feasibility, this instance's own geometry: the sweep's own page assignment is
+# NOT frozen -- `perf_probe` drives the candidate's own allocator, exactly like
+# `generation_probe` (USE_FROZEN_ALLOCATION["perf"] = False) -- so the only
+# thing that has to fit is the COUNT: ceil((prompt_len 11 + 16) / page_size 8)
+# = 4 <= pages_per_seq (4), no headroom, and 11 + 16 = 27 <= max_model_len (32).
+# the harness enforces both, per instance.
+#
+# NO `perf_page_ids` COUNTERPART, and its absence is deliberate rather than
+# pending: that key shipped briefly and was DELETED (the freezer and fixtures.py
+# both name it), because nothing reads a frozen perf
+# page list.
+#
+# `golden/perf.json` IS FROZEN AND `perf_graded` IS STILL ABSENT, WHICH IS A
+# JUDGEMENT AND NOT AN OMISSION. It is frozen on the pinned H100 SKU
+# (`ref_step_ms 109.4445`, `ref_intercept_s -0.044688`,
+# `rounds_used 3`) -- unlike core_qwen3, whose reference could not resolve a
+# slope at all ("quorum not met: 0 of 3"), this one resolves. What it does not do
+# is resolve REPEATABLY, and that is what `perf_graded` needs.
+#
+# MEASURED as a ten-trial perf-precision study, grading the REFERENCE against
+# its OWN frozen
+# slope -- so every departure from 1.0 below is the instrument, not a port:
+#
+#   shipped reduction (median-of-3, exactly what `test_decode_speed` would read)
+#     n 10   min 0.8559   median 0.9355   mean 1.0327   max 1.4392
+#     stdev 0.2019   p90 1.3675   p99 1.4320   max deviation from 1.0: 43.9%
+#   discard-round-0 (the alternate reduction, same trials)
+#     n 10   min 0.8376   median 0.9140   max 1.4767   p99 1.4591
+#   the ten ratios, in order:
+#     0.9245 0.9204 1.4392 0.9076 0.9464 0.9091 1.3596 0.8559 1.0547 1.0096
+#   per-round fitted step time across all 30 rounds: 89.7 ms .. 165.7 ms (1.85x)
+#   2-sigma RELATIVE interval on each round's fitted slope: 23.6% .. 53.0%,
+#     median 36.9% -- the fits clear the quorum's 2-sigma test, but only just
+#
+# `delta = p99(ratio) - 1` is therefore 0.432: a gate that admits a port 43%
+# slower than the reference. Three reasons that is not worth declaring, and the
+# third is the one that decides it:
+#   1. it does not gate anything a correct port could fail, and a threshold that
+#      cannot fail is the defect this class has spent the slice removing;
+#   2. the perf-precision tool's own docstring refuses to choose
+#      `delta` from same-day scatter -- that is the mistake behind a near-miss
+#      elsewhere (2.6% off two samples, 7.90% off a third);
+#   3. the SPREAD IS THE INSTRUMENT, not the port. The same reference on an idle
+#      GPU read `perf_ratio` 1.2764 in one graded run and 0.9076 in another
+#      thirty minutes later. A number derived from that measures host contention.
+#
+# WHY THIS INSTANCE IS NOISY WHERE THE TEXT-ONLY FIVE ARE NOT is not established
+# and is deliberately not guessed at here. What IS measured: the vision tower is
+# UNCOMPILED (it cannot be traced as written on jax 0.11) and runs ONCE, at
+# prefill -- the engine test suite asserts `engine._traces == 2`
+# over a prefill plus four decode steps -- so it lands in `ref_intercept_s` and
+# not in the slope. The negative intercept (-0.0447) says the fit is being pulled
+# by the K=16 leg, which is where a re-examination should start.
+#
+# So `test_decode_speed` stays deselected (`ungraded+no_golden_here` in
+# `eval_summary.json`'s `deselected_kinds`, of which only the `ungraded` half is
+# now true -- that string is a static class-wide label, not a per-instance
+# finding) and `graded_checks` is 39. `perf.json` is an OPTIONAL golden and this
+# degrades to a visible coverage gap, which is the designed behaviour.
+perf_k_values: [2, 4, 8, 16]
+
+# Canonical probe. One sequence, 11 prompt tokens, 8 greedy decode steps.
+#
+# THE PROMPT IS A BARE COMPLETION PROMPT WITH NO CHAT TEMPLATE, exactly as
+# core_qwen2's and core_qwen3's are, and that is load-bearing on this family
+# rather than a stylistic carry-over. MEASURED: the processor's
+# `apply_chat_template` renders this same request at 29 ids, and 29 + 8 decode
+# steps overruns `max_model_len` (32) -- so a templated prompt would have forced
+# either a longer context (varying the geometry, which this instance exists not
+# to do) or fewer decode steps.
+#
+#   text  '<|vision_start|><|image_pad|><|image_pad|><|image_pad|><|image_pad|>'
+#         '<|vision_end|>' + 'The picture shows a bright'
+#
+# The six leading ids are the vision markers: `<|vision_start|>` (151652), FOUR
+# `<|image_pad|>` (151655) and `<|vision_end|>` (151653). FOUR is not a choice --
+# it is what the 56x56 fixture forces. 56*56 == 3136 == the processor's
+# `min_pixels` exactly and 56 is a multiple of patch_size(14) * merge_size(2) ==
+# 28, so `smart_resize` is a no-op, the grid is (1, 4, 4) and the 16 patches
+# merge 2x2 into 4 image tokens. Measured in-container, against the real
+# processor: `image_grid_thw [[1, 4, 4]]`, `pixel_values (16, 1176)`.
+# So 6 marker ids + 5 text ids = 11, which is core_qwen2's and core_qwen3's
+# prompt_len -- NOT core_llama3's, which is 12 because llama3 prepends a BOS.
+# This tokenizer prepends none (`add_bos_token: false`, `bos_token: null`).
+#
+# SCREENED OVER TWENTY CANDIDATES, and the screening REJECTED the one the design
+# note proposed. The twenty-way sweep was run through `transformers`; every number
+# quoted below was then RE-MEASURED by driving `environment/torch_orig` ITSELF --
+# its `ModelConfig.from_hf`, its `load_weights`, its `get_mrope_input_positions`,
+# its `BlockPool`/`AttentionMetadata`, the frozen page assignment `[2, 0, 3]`, the
+# frozen fixture's own `pixel_values`/`image_grid_thw`, bfloat16, CPU.
+#
+# TWO METHOD FAULTS IN THE FIRST SCREEN, both of which changed numbers in this
+# file, both recorded because either one silently corrupts a future screen:
+#
+#   1. THE EOS STOP HIDES SEVEN OF THE EIGHT MARGINS. `generate` stops at
+#      `<|im_end|>`; the reference `Engine` has NO EOS handling and decodes
+#      exactly `num_decode_steps` tokens whatever comes out. The first screen let
+#      it stop, so the proposed candidate reported ONE margin (3.875, which looks
+#      excellent) and nothing about the other seven -- one of which is at the
+#      floor. Suppress the stop.
+#   2. `generate` APPLIES `repetition_penalty` AND THE REFERENCE DOES NOT.
+#      `Qwen/Qwen2.5-VL-3B-Instruct/generation_config.json` sets 1.05 and
+#      `generate` honours it even under `do_sample=False`; `engine.py`'s decode
+#      loop applies no penalty of any kind. A margin taken through `generate`
+#      is therefore a raw margin divided by 1.05 -- exactly: a raw 1.0 reads
+#      0.9524, a raw 3.625 reads 3.4524, a raw 0.125 reads 0.1190. That also
+#      MANUFACTURES two disqualifications; see the 0.0 note below.
+#
+# TWO CRITERIA, AND THEY PULL IN OPPOSITE DIRECTIONS. That tension is the whole
+# finding here, and it does not arise on the text-only families:
+#
+#   (a) every one of the eight greedy top1-top2 margins must clear 0.125, the
+#       floor this class screens against -- a smaller gap is a top-1 a correct
+#       port's own bf16 noise can flip;
+#   (b) the PREFILL row's top-1 probability must NOT be near 1. That row is what
+#       the sampler grid cuts, and ragged_llama3 measured what happens when it is
+#       concentrated (0.948 there): a top_p point keeps ONE token, a one-token
+#       mask is invariant under every permutation of temperature/top_k/top_p, and
+#       `test_sampler_transforms` silently stops grading the chain's ORDER.
+# On this checkpoint the two are ANTI-CORRELATED, measured across all twenty: a
+# bare vision prompt whose text invites a confident answer puts nearly all its
+# mass on `<|im_end|>` (top-1 0.85 to 0.99) and then decodes chat-control tokens
+# whose margins are erratic, while a prompt that leaves the sentence genuinely
+# open spreads the mass and decodes English. The five candidates with top-1 above
+# 0.85 all emitted `<|im_end|>` as their FIRST token.
+#
+# ALL FIGURES BELOW ARE RAW, MEASURED ON THE REFERENCE ITSELF.
+#
+#   'The picture shows a bright'  <- CHOSEN. At or near the top of BOTH rankings.
+#     generated  ' yellow square' then <|im_end|> and chat-control tokens
+#     eight margins  0.75 0.75 3.5 10.5 9.9375 5.25 10.3125 0.75
+#     tightest 0.75 -- 6.0x the 0.125 floor (core_qwen3's own tightest was 0.5,
+#     at 4x, so this instance has MORE headroom than the last family did)
+#     prefill row's top-1 probability  0.164431
+#     RE-READ OFF THE FROZEN GOLDENS, once they existed. The EIGHT
+#     margins are the PREFILL row (`prefill_forward.npz::logits[-1]`, which is
+#     the row that generates token 0) plus `decode_step.npz`'s `logits_step_0`
+#     THROUGH `logits_step_6` -- seven of its eight rows, not all of them. The
+#     count is 1 + 7 and not 8 + 1 because a margin belongs to the row a token
+#     was SAMPLED FROM, and `Engine.generate` discards the final decode step's
+#     logits on purpose (see its docstring); `Golden.decode_margins` implements
+#     exactly this slice, `steps[: num_decode_steps - 1]`. Counting
+#     `decode_step.npz`'s EIGHT rows instead would give nine rows for eight
+#     margins. The probability is from that same prefill row. The generated
+#     sequence is `[13753, 9334, 151645, 198, 151644, 198, 151644, 198]`.
+#
+#   'The image above contains a'  <- runner-up, and it would have been fine:
+#     margins 0.6875 1.0 8.125 10.25 11.25 5.625 9.75 1.875 (tightest 0.6875,
+#     5.5x) and top-1 0.0704. Recorded because "the chosen one was the only
+#     survivor" would overstate how tight the search was.
+#
+#   'This is a picture of'        <- REJECTED, and it was a proposed alternative
+#     generated  <|im_end|> IMMEDIATELY, then chat-control tokens
+#     eight margins  3.875 10.125 10.0 1.25 5.75 3.0 0.125 8.8125
+#     prefill row's top-1 probability  0.9725
+#     FAILS BOTH CRITERIA. Its seventh decode margin is EXACTLY 0.125 -- AT the
+#     floor, not below it, and the distinction matters because the rejection rests
+#     on precedent rather than on arithmetic: core_qwen3 rejected a candidate for
+#     sitting at exactly 0.125 ("passed criterion 1 only at the floor itself...
+#     not pursued given a candidate with real headroom"), and that is the ground
+#     here too. And its prefill row is the ragged_llama3 shape exactly.
+#
+#   'The picture above shows a'   <- REJECTED, kept in the record rather than
+#     quietly dropped.
+#     eight margins  0.1875 0.375 0.25 0.875 2.5 0.5 0.875 10.875
+#     top-1 0.0569. Tightest 0.1875, only 1.5x the floor, and EQUAL to
+#     `native_thresholds.argmax_margin` -- so that decode position would have been
+#     excused from decisiveness rather than graded on it.
+#
+# ONLY ONE OF THE TWENTY MEASURES AN EXACT 0.0 MARGIN RAW. 'Here we can see
+# a' has a 0.0 gap at decode step 2 on the reference and is disqualified outright
+# -- a coin flip no threshold can excuse. Two others, 'In the picture above,'
+# and 'The main colour in the', read 0.0 only through the `repetition_penalty`
+# fault above; RAW they are 0.125, not 0.0. Both are still rejected -- at the
+# floor, like the proposed alternative -- but disqualifying on a manufactured
+# number is the failure this note exists to stop repeating.
+#
+# The ids are pinned here, not the text, because THE FREEZER MUST NOT DEPEND ON A
+# TOKENIZER. Round-tripped at encode time: `tok.decode(prompt_token_ids,
+# skip_special_tokens=False)` reproduces the string above exactly.
+prompt_len: 11
+num_decode_steps: 8
+prompt_token_ids: [151652, 151655, 151655, 151655, 151655, 151653, 785, 6802, 4933, 264, 9906]
+
+# ===========================================================================
+# THE CHUNKED AXIS -- and on this cell it is the axis that meets the image.
+#
+# Split at 5, the value chunked_llama3 / chunked_qwen2 / chunked_qwen3 all use,
+# so the mode column is held fixed. It is OFF a page boundary (page_size is 8),
+# so the canonical scenario exercises a partial-page write: chunk 1 fills slots
+# 0-4 of page 2 and chunk 2 resumes at slot 5.
+#
+# ON THIS INSTANCE 5 IS ALSO THE TIGHTEST LEGAL BOUNDARY, and that is the whole
+# intersection of the two axes in one integer. The `<|image_pad|>` run is
+# [1, 5) -- ids 1..4 -- so a split at 5 is the FIRST position at which the run is
+# entirely inside chunk 1. Splits 2, 3 and 4 fall inside the run and are refused
+# by name on BOTH frameworks (see the header's measured table); split 1 would put
+# the run in chunk 2 and is legal but is not a partial-page write of the image's
+# own page. So the mode parent's value and this cell's constraint pick the same
+# number, and the canonical scenario is the boundary that touches the image
+# without splitting it.
+#
+# `validate_geometry` reads only the LAST entry (`chunk_start = chunk_split_points
+# [-1]`), and that is not a shortcut: a chunk boundary is invisible once its KV is
+# written, so only the FINAL boundary is a property of the graded forward's
+# metadata. What tests that a candidate really made N calls is
+# `test_chunked_prefill_logits` (via `chunked_prefill_probe`, which drives the
+# candidate's own `Engine.prefill` once per split) and `test_chunking_invariance`.
+#
+# THE BATTERY'S FOUR SPLIT POINTS ARE DERIVED, NEVER HARDCODED, and every one of
+# them has to clear the same constraint. MEASURED against the real freezer, which
+# derives the boundary cases (page_size=8, n_tokens=11,
+# own_split=5) as {aligned: [8], interior: [5], far_interior: [9], tail: [10]},
+# nothing dropped, four distinct values. All four are >= 5, so the placeholder run
+# sits entirely in the warm-up chunk of every variant and none straddles it.
+# `interior` is 5 only because 0 < 5 < page_size holds; had this instance's own
+# split been >= 8 the derivation would have fallen back to `page_size // 2` = 4,
+# which is INSIDE the run -- so the fallback is the one geometry this cell may
+# not have, and `build_chunk_boundary` now refuses a straddling split by name
+# rather than letting it surface as a placeholder-count mismatch.
+chunk_split_points: [5]
+
+# ===========================================================================
+# THE THREE REQUESTS. Each `page_ids` list is validated by
+# the freezer's `validate_sequences` (exact count, no repeats, no
+# negatives, no `page_ids[i] == i`, no cross-request overlap):
+#   r0 owns pages {2, 0, 3}   restates the top-level list; 3 = ceil((11 + 8) / 8)
+#   r1 owns pages {7, 6}      2 = ceil(9 / 8); the mode/family parents' own third
+#                             request, unchanged
+#   r2 owns page  {5}         1 own page; its OTHER page is r1's page_ids[0]
+#                             (physical page 7), on LOAN from the prefix cache
+# {0, 2, 3, 5, 6, 7} are pairwise disjoint -- six of the twelve-page pool.
+#
+# `validate_sequences` RESOLVES r2 rather than taking it literally: it prepends
+# r1's `page_ids[0]`, rewrites r2's stage to `prefill_chunked` and sets its chunk
+# start to `shared_prefix_len`. So the resolved batch is
+#   0  prefill_chunked  11 tok  pages [2, 0, 3]  chunk_start 5   image
+#   1  decode            9 tok  pages [7, 6]
+#   2  prefill_chunked  11 tok  pages [7, 5]     chunk_start 8   shared 8
+# and `request_distribution` is [1 decode, 0 bare prefill, 2 chunked] -- the same
+# chunked signature the three text-only chunked instances freeze.
+#
+# ---------------------------------------------------------------------------
+# WHY THE PREFIX SHARE IS r2 -> r1 AND NOT r2 -> r0, WHICH IS THE ONE PLACE THIS
+# CELL'S BATCH DEPARTS FROM ITS MODE PARENT'S. This is the intersection reaching
+# the PLAN, and it is forced, not preferred.
+#
+# On chunked_llama3 / chunked_qwen2 / chunked_qwen3 the sharing request borrows
+# from r0. Here r0 is the multimodal request and its first 8 ids are
+#     [151652, 151655, 151655, 151655, 151655, 151653, 785, 6802]
+# -- `<|vision_start|>`, the four `<|image_pad|>` placeholders, `<|vision_end|>`,
+# `The`, ` picture`. `validate_sequences` requires a sharing request's leading
+# `shared_prefix_len` ids to be BYTE-IDENTICAL to its lender's, and
+# `shared_prefix_len` must be a positive multiple of page_size (8) because
+# PrefixCache shares whole pages only. So a share with r0 necessarily copies the
+# four placeholders into r2.
+#
+# A request whose ids carry `<|image_pad|>` and which declares no image is then
+# unfreezable: `_positions_for` calls the model's own
+# `get_mrope_input_positions` with no grid and it refuses -- "the prompt has 1
+# run(s) of <|image_pad|> but 0 grid(s) were supplied. Positions cannot be built
+# for an image whose geometry is unknown." And r2 CANNOT declare the image
+# instead, because `validate_sequences` refuses a second `image: true` ("this
+# instance freezes exactly one fixture"). Both refusals are correct; together
+# they close the r2 -> r0 share on any multimodal instance whose image sits
+# inside the first page.
+#
+# Sharing from r1 -- a text-only request -- costs nothing that is actually
+# graded. `has_prefix_cache` is `has_chunked` (conftest), i.e. the MODE, not the
+# plan, so `test_prefix_cache_invariance` is collected either way and it reads
+# whichever request declares `shares_prefix_with`; `_invariance_prefix_cache`
+# then prefills r1 and r2, both text-only, and needs no image at all. The graded
+# count is unchanged.
+#
+# `shares_prefix_with` IS MANDATORY, NOT DECORATIVE. `_CandidateRuntime.
+# _invariance_prefix_cache` finds the sharing request in the FROZEN scenario and
+# returns {"supported": False} when none declares one, and `test_behavioral.
+# _legs` asserts `probe.get("supported")`. A chunked instance with no sharing
+# request FAILS a graded check.
+#
+# ---------------------------------------------------------------------------
+# r2's TOKENS: THE FOUR-CLAUSE SCREEN, re-run for this lender.
+#   (1) exactly 11 tokens, so chunk_start = shared_prefix_len = 8 leaves a
+#       3-token graded tail -- the same shape all three text-only chunked
+#       instances have, which is what keeps the mode-axis comparison honest;
+#   (2) ids[:8] == r1's ids[:8] byte-for-byte, which validate_sequences enforces;
+#   (3) ids[8] != r1's ids[8] (15678, ' lazy'). A prefix cache that wrongly
+#       served r1's SECOND page would otherwise be ACCIDENTALLY RIGHT on the
+#       first unshared token and `test_prefix_cache_invariance` would stop
+#       discriminating. Nothing in the class checks this; it is asserted by hand.
+#   (4) THE ARGMAX MARGIN, which is the clause that decided the choice.
+#       `test_batching_invariance` compares the two legs' argmax with NO
+#       tie-break latitude and `test_ragged_forward_logits` grades the frozen
+#       forward at `argmax_margin`. ragged_llama3 shipped a 0.0-gap tie once and
+#       a control mutation that changes no value at all then "caught" the check
+#       by flipping it back; the bar that episode set is a gap of at least 1.0.
+#
+# TWENTY-SEVEN CANDIDATES SCREENED for clauses 1-3 against the shipped
+# `tokenizer.json`; the twenty-five that survived were MEASURED end-to-end for
+# clause 4 on this instance's own transplanted reference, bfloat16, under
+# the graded path's two pins (JAX_DEFAULT_MATMUL_PRECISION=highest,
+# XLA_FLAGS=--xla_gpu_autotune_level=0), single-sequence. Top of the table:
+#
+#   candidate               ids[8:]              argmax          gap
+#   ' green picket'         6176, 3735, 295      24650 ' fence'  5.0625  <- CHOSEN
+#   ' tall building in'     16217, 4752, 304       279 ' the'    1.5625
+#   ' narrow dirt road'     15026, 25284, 5636      13 '.'       1.3750
+#   ' famous tower in'      11245, 21271, 304      279 ' the'    1.2500
+#   ' large lake in'        3460, 21800, 304       279 ' the'    1.2500
+#   ' old wooden gate'      2310, 22360, 18126      13 '.'       1.1250
+#   ' green field in'       6176, 2070, 304        279 ' the'    1.0625
+#   ...seventeen more below 1.0625, the weakest ' tired old dog' at 0.1250.
+#
+# ' green picket' wins by 3.24x over the next candidate and clears the 1.0 bar by
+# 5.06x. It is the only one in the field whose continuation is lexically forced
+# rather than syntactically likely -- ` picket` -> ` fence` -- which is the
+# property the screen is actually after, and the reason it is not a near-tie in
+# any precision. FOR SCALE: chunked_qwen2 chose at 3.1250 and chunked_llama3's
+# own sharing request measures 0.1250, BELOW its own argmax_margin of 0.1875.
+#
+# r1's own last row measures 4.6250 (argmax 5562, ' dog') at the same settings.
+# The in-batch figures are re-measured off the frozen artifacts after the freeze
+# -- see the `argmax_margin` block, which records both.
+#
+# NOT MEASURED WITH a per-instance margin diagnostic, and that is deliberate:
+# that diagnostic's own docstring records a KNOWN LIMIT ("positions are
+# `range(start, n)` ... would NOT agree for an M-RoPE family"), and its claim
+# that "`_build_batch` refuses one outright" is STALE now that the freezer
+# handles per-sequence images. On
+# an M-RoPE family it builds rank-1 positions for every request, including the
+# text-only ones, where the freezer builds rank 3. Reported; not fixed here.
+# ---------------------------------------------------------------------------
+sequences:
+  # r0 is the CHUNKED MULTIMODAL request: the same 11 tokens core_qwen2_5_vl and
+  # ragged_qwen2_5_vl freeze ("The picture shows a bright", with the vision
+  # markers), prefilled in two calls (see `chunk_split_points` above), then 8
+  # decode steps. Restated here because `validate_sequences` compares
+  # sequences[0] to the top-level keys by exact list equality.
+  #
+  # `image: true` puts the instance's ONE fixture on this request. Its
+  # placeholders are [1, 5) and its chunk boundary is 5, so the run lies entirely
+  # in the warm-up chunk -- which is what makes the frozen batch carry a
+  # `warmup_pixel_values` pair rather than a graded one. The top-level pair in
+  # inputs.npz is sequence 0's picture either way (`_Freeze.mm_inputs`), which is
+  # what the twenty single-sequence probes read.
+  - {request_id: 0, stage: prefill_chunked, page_ids: [2, 0, 3], image: true,
+     prompt_token_ids: [151652, 151655, 151655, 151655, 151655, 151653, 785, 6802, 4933, 264, 9906]}
+  # r1 is the family parent's third request, unchanged: "The quick brown fox
+  # jumps over a very lazy" -> " dog". 9 tokens (> page_size) put its decode token
+  # at position 8, the FIRST slot of its SECOND page, which is the case a
+  # single-page sequence cannot produce; its page list is REVERSED so a
+  # block-table read in the wrong order is visible. It is ALSO the lender here --
+  # see the share note above for why the lender moved off r0.
+  - {request_id: 1, stage: decode, page_ids: [7, 6],
+     prompt_token_ids: [785, 3974, 13876, 38835, 34208, 916, 264, 1602, 15678]}
+  # "The quick brown fox jumps over a very green picket" -> " fence" (24650).
+  # First 8 ids byte-identical to r1's; token 8 = 6176 where r1's is 15678; top1
+  # -top2 gap 5.0625 single-sequence. See the four-clause screen above.
+  - request_id: 2
+    stage: prefill
+    shares_prefix_with: 1
+    shared_prefix_len: 8
+    page_ids: [5]
+    prompt_token_ids: [785, 3974, 13876, 38835, 34208, 916, 264, 1602, 6176, 3735, 295]
+
+# MEASURED. Method: reference-as-candidate --
+# `solution/ref_jax_repo` graded against goldens frozen from
+# `environment/torch_orig` -- run inside `t2j-inference-verifier:core-qwen2-5-vl`
+# (the exact oracle grading configuration) under the two graded pins
+# JAX_DEFAULT_MATMUL_PRECISION=highest and --xla_gpu_autotune_level=0. Class
+# convention: worst of at least three container runs.
+#
+# THREE INDEPENDENT PROCESSES ON THREE DIFFERENT GPUS. All 123
+# threshold-consuming statistics -- every array surface's `max_i(|d_i| -
+# rel_tol*|ref_i|)`, every logit surface's centered cosine / raw cosine /
+# token_kl / per-position argmax, all 37 hidden-state layers, both generation
+# tiers and all 25 held-out rows -- came back BIT-IDENTICAL across all three, so
+# "worst of three" and "the one run" are the same number here, as on core_qwen2
+# and core_qwen3 with the graded autotune-off pin. Every ratio below is therefore
+# pure model margin and not a run-noise budget.
+#
+# THREE OF THE ELEVEN VALUES MOVED OFF THE CLASS/CARRY-OVER NUMBER, and each was
+# FORCED by measurement rather than chosen: `argmax_margin` 0.1875 -> 0.25,
+# `centered_cosine_floor` 0.998 -> 0.99, `abs_tol.hidden_states` 4.0 -> 24.0.
+# One key is NEW: `centered_cosine_floor.hidden_states`. The remaining seven are
+# the class-standard values, kept because they clear with the margins recorded
+# beside them -- the same discipline core_qwen3 followed, and what keeps
+# cross-family comparison of these numbers meaningful.
+#
+# THE ONE-LINE SUMMARY OF WHY THIS FAMILY IS DIFFERENT: on the native tier the
+# binding surfaces are the four `<|image_pad|>` rows and the `<|vision_start|>`
+# row, not the text rows -- and at the deep end the massive-activation collapse
+# lands on the text row at position 0. Both are recorded per surface below.
+fp32_thresholds:
+  # `check_array`'s absolute term, for every fp32 ARRAY surface: the isolated
+  # attention output, the twelve reference-unit outputs, the nine vision-tower
+  # unit outputs, `pixel_values`, the six sampler grid points and topn_logprobs.
+  #
+  # THE FLOOR ON THIS CHECKPOINT, `max_i(|d_i| - 1e-3*|ref_i|)` (`check_array`'s
+  # own comparison, rel_tol from FP32_EXACT_THRESHOLDS), the surfaces that need
+  # anything at all:
+  #   vision_tower_units/tower/tower.out0        4.3007e-05   <- BINDS
+  #   reference_units/lm_head/lm_head.out0       1.4067e-05
+  #   paged_attention/fp32                       8.0128e-06
+  #   vision_tower_units/patch_embed             3.6911e-06
+  #   reference_units/qkv_proj.out0              8.8489e-07
+  #   reference_units/gate_up_proj.out0          3.4449e-07
+  #   reference_units/down_proj.out0             2.7436e-07
+  #   reference_units/o_proj.out0                8.0988e-08
+  #   the other 13 surfaces (both rotary outputs, both layernorms, both
+  #   final_norm outputs, image_preprocess/pixel_values, the six sampler grid
+  #   points, topn_logprobs, the tower's two rope tables) all NEGATIVE -- the
+  #   relative term alone covers them.
+  # floor 4.3007e-05 -- THE VISION TOWER'S OWN OUTPUT, and this is the first
+  #                    instance in the class where `lm_head.out0` is NOT the
+  #                    binding fp32 surface: it is 3.06x above it. Reported
+  #                    separately because the tolerance ladder had never been
+  #                    calibrated against a ViT -- see the block after this key.
+  # value 1.0e-4    -- ratio 2.33x.
+  #
+  # THE TOWER'S OWN fp32 BAND, REPORTED SEPARATELY. A patch-embedding
+  # convolution plus 32 blocks of window attention is a new numerical shape for
+  # this ladder, so the two questions are kept apart:
+  #   * the CONVOLUTION alone (`patch_embed`, one matmul over a length-1176
+  #     contraction) needs 3.6911e-06 -- 3.8x BELOW `lm_head.out0` and utterly
+  #     unremarkable. The new shape is not what costs anything.
+  #   * the WHOLE ENCODER (`tower.out0`, 32 blocks + the window permutation +
+  #     the patch merger, on the 140x140 fixture's 10x10 grid) needs 4.3007e-05,
+  #     raw max|d| 2.4414e-04 against a peak of 20.898.
+  # So the tower's cost is DEPTH, not the convolution and not the windowing:
+  # 4.3e-05 / 20.9 = 2.06e-06 relative, which is the same order as the text
+  # decoder's own lm_head figure (1.41e-05 / 27.83 = 5.05e-07) times the ~4x
+  # more sequential reductions between the two. Cross-checked against
+  # the parity checks, which compare the same tower torch-vs-JAX outside the
+  # graded harness and measure raw max|d| 2.308e-04 on the same fixture -- the
+  # two agree to within the difference between a golden read from disk and a
+  # live torch forward.
+  #
+  # 2.33x IS THE THINNEST RATIO IN THIS FILE, and it is kept rather than widened.
+  # Widening to 2.0e-4 would buy 4.65x on ONE surface and loosen the other 20
+  # fp32 surfaces by 2x for it; every one of those has orders of margin today and
+  # none of them asked. The measurement is bit-identical across three processes
+  # on three GPUs, so 2.33x is 2.33x of real model margin with no run-noise
+  # component to absorb. If a future re-freeze moves the tower, this is the first
+  # number to re-read.
+  abs_tol: 1.0e-4
+  # Minimum per-token CENTERED cosine on the fp32 prefill logits (the only fp32
+  # logit surface -- `has_fp32_decode` is deselected on every instance). Not a
+  # `NumericThresholds` field; served through `Golden.fp32_extras`.
+  #
+  # QUANTISED, not ratio'd: both cosine clauses accumulate in float32, where the
+  # spacing next to 1.0 is one quantum = 2^-24 = 5.9605e-08.
+  #   floor 2.0 quanta  (1-c = 1.1921e-07, on the fp32 prefill logits; all
+  #                      eleven rows read exactly 1.0 to float32, and the
+  #                      MINIMUM over rows is where the two quanta appear)
+  #   value 8.39 quanta (1-c = 5.0e-07) -- ratio 4.19x (quanta over quanta).
+  # Class-standard value, identical on all five shipped instances. The fp32 tier
+  # is where the image path is INVISIBLE: all eleven argmaxes agree, including
+  # the four `<|image_pad|>` rows and position 8, which is the one the NATIVE
+  # tier flips (see `argmax_margin`).
+  centered_cosine_floor: 0.9999995
+  # Per-token absolute bound on the free-running generation's chosen-token
+  # logprob, fp32 KV cache, read by `test_behavioral.test_decode_trajectory`.
+  #   floor 2.8610e-05 -- MEASURED, three processes bit-identical.
+  #   value 4.0e-4     -- ratio 13.98x.
+  # Class-standard value. This 3.75B checkpoint is the QUIETEST of the three
+  # Qwen instances on this surface (core_qwen2 3.684e-05, core_qwen3 4.339e-05),
+  # which is worth recording because the naive expectation -- a bigger model
+  # accumulates more -- is the wrong way round over an eight-step chain.
+  logprob_atol: 4.0e-4
+  # Absolute bound on the CUMULATIVE sequence logprob, measured directly and
+  # never derived as `logprob_atol * num_decode_steps` (that form is
+  # mathematically unreachable once the per-token clause has already passed --
+  # see core_qwen2's file for the inequality chain).
+  #   floor 5.1715e-05 -- MEASURED, three processes bit-identical. sum|d| over
+  #                      the eight steps is 6.55e-05 against |sum d| =
+  #                      5.17e-05, i.e. the per-step differences PARTIALLY
+  #                      CANCEL (21%) -- core_qwen2's shape, not core_qwen3's
+  #                      no-cancellation one.
+  #   value 1.7e-3     -- ratio 32.87x, the loosest band in this file, and it is
+  #                      the class-standard value rather than a number chosen
+  #                      here. Kept, and disclosed: it STILL BINDS, because the
+  #                      derived (unreachable) form is logprob_atol * 8 = 3.2e-3
+  #                      and 1.7e-3 sits 1.88x below it -- so this clause is not
+  #                      inert, it is simply generous on a checkpoint whose eight
+  #                      steps happen to cancel.
+  logprob_cumulative_atol: 1.7e-3
+  # Per-token absolute bound on the TEACHER-FORCED held-out logprobs (L6),
+  # `test_behavioral.test_held_out_logprobs` clause 1.
+  #   floor 7.8917e-05 -- MEASURED, three processes bit-identical.
+  #   value 7.5e-4     -- ratio 9.50x.
+  # tests/held_out_prompts.yaml's 25 rows re-tokenized IDENTICALLY under this
+  # checkpoint's tokenizer, so the scored positions are the same set core_qwen2
+  # and core_qwen3 measured on. Geometry, re-measured off `golden/held_out.npz`
+  # rather than assumed: prompt_lens [2, 6, 7, 8, 14, 15, 16, 22], cont_lens
+  # [1, 4, 6, 8, 12], max total 30, mean logprob -1.8967.
+  held_out_logprob_atol: 7.5e-4
+  # Absolute bound on the held-out set's per-sequence summed logprob, clause 2,
+  # measured directly (never `held_out_logprob_atol * cont_len`).
+  #   floor 3.4241e-04 -- MEASURED, three processes bit-identical.
+  #   value 4.0e-3     -- ratio 11.68x.
+  held_out_seq_atol: 4.0e-3
+
+# ===========================================================================
+# RE-MEASURED FOR THIS INSTANCE and not inherited. The values below
+# are the family parent's SHAPE with this cell's own numbers behind them; one
+# key was removed on the strength of the measurement (see `centered_cosine_
+# floor.hidden_states`'s block above) and one is at its exact floor.
+#
+# METHOD: the floor plugin, a pytest plugin over the whole
+# graded suite -- it computes nothing itself, it wraps the suite's OWN gates
+# (`_assert_array_parity`, `_formulas.centered_cosine`, `compare
+# .check_logits_strict`, `Golden.decode_margins`) and reports what each one saw.
+# Reference as candidate, `T2J_GRADE_THE_REFERENCE=1`, both graded pins
+# (`JAX_DEFAULT_MATMUL_PRECISION=highest`, `--xla_gpu_autotune_level=0`), 47
+# passed / 4 deselected in 671 s. 69 abs_tol rows, 63 centered-cosine rows, 26
+# logits_strict rows, 4 behavioral rows.
+#
+# THE WHOLE TABLE, worst case per key, with the UNITS each ratio is in:
+#
+#   key                              declared   worst measured        headroom
+#   ---------------------------------------------------------------------------
+#   argmax_margin                    0.25       gap in [0.1875, 0.25)   1.00x  <<
+#   abs_tol.hidden_states            24.0       max|d| 14.0 (hidden_33) 4.01x
+#   decisive_margin                  0.125      min decode gap 0.75     6.00x
+#   centered_cosine_floor            0.99       c 0.999044              10.46x
+#   abs_tol.kv_cache_state           2.0        max|d| 0.5              22.80x
+#   fp32 abs_tol                     1.0e-4     max|d| 4.72e-05         64.49x
+#   fp32 centered_cosine_floor       0.9999995  c 0.999999761581         2.10x
+#   fp32 logprob_atol                4.0e-4     3.0994e-05              12.91x
+#   fp32 logprob_cumulative_atol     1.7e-3     5.2624e-05              32.31x
+#   fp32 held_out_logprob_atol       7.5e-4     6.5804e-05              11.40x
+#   fp32 held_out_seq_atol           4.0e-3     3.0428e-04              13.15x
+#   max_kl  (CLASS DEFAULT, native)  0.1        KL 7.5888e-03           13.18x
+#
+#   A HEADROOM IS `band / measured` for an absolute tolerance and
+#   `(1 - floor) / (1 - measured)` for a cosine. The `abs_tol` bands include the
+#   tier's relative term (`rel_tol` is 0.1 at the native tier and 1.0e-3 at
+#   fp32), so e.g. hidden_33's band is 24.0 + 0.1*322 = 56.2, not 24.0. Reading
+#   those rows against the declared number alone understates the headroom by
+#   2.3x.
+#
+# `max_kl` IS THE ONE TO WATCH AND IT DID NOT BREAK -- report the contradiction.
+# It is a class default with no per-instance declaration anywhere, and its
+# measured headroom was reported falling 16.07x -> 5.95x on the core -> ragged
+# step and to 5.43x on `ragged_qwen2_5_vl`, with the expectation that `chunked`
+# adding a second battery axis would be what finally broke it. MEASURED HERE:
+# 13.18x, on `chunked_prefill_logits` (KL 7.589e-03 against 0.1) -- BETTER than
+# the ragged VL cell by 2.4x, not worse. The extrapolation does not hold, and
+# the reason is visible in the same table: the chunked axis's own rows
+# (`chunk_boundary_battery[interior]` at 7.589e-03, `[aligned]` at 3.244e-04)
+# are not the tightest thing here; the tightest KL row is shared with the
+# unchunked prefill.
+#
+# `argmax_margin` IS AT ITS EXACT FLOOR AND THAT IS THE HEADLINE OF THIS BLOCK.
+# See its own comment below.
+native_thresholds:
+  # POSITION-LEVEL decisiveness (`compare.check_logits_strict`'s
+  # `decisive = gap > argmax_margin`), read on `test_prefill_logits` and
+  # `test_multimodal_prefill_logits` (11 rows each, the same golden row) and the
+  # eight `test_decode_step_logits` calls.
+  #
+  # 0.25, NOT THE CLASS-STANDARD 0.1875, AND THE MEASUREMENT FORCED IT. At 0.1875
+  # the reference-as-candidate FAILS its own oracle: the eleven prefill-row
+  # top1-top2 gaps are
+  #     6.125  0.25  0.125  0.625  0.125  0.375  0.75  6.25  0.25  0.375  0.75
+  # and the reference FLIPS THE ARGMAX AT POSITION 8, whose gap is 0.25. At
+  # 0.1875 that position is decisive and `argmax_ok` is False; at 0.25 it is
+  # excused (`decisive = gap > margin`, so a gap EQUAL to the margin is excused).
+  #
+  # THIS IS NOT A THRESHOLD CHOSEN TO MAKE A TEST PASS, and the number that says
+  # so is the CROSS-PORT DEVIATION AT THE GOLDEN'S OWN TOP-2 COLUMNS, measured
+  # per prefill row (three processes bit-identical):
+  #     row      0      1      2      3      4      5      6      7      8      9     10
+  #     gap  6.125  0.250  0.125  0.625  0.125  0.375  0.750  6.250  0.250  0.375  0.750
+  #     dev  0.250  0.250  0.250  0.250  0.250  0.250  0.062  0.000  0.375  0.125  0.000
+  # A position is REACHABLE by a correct port's own bf16 noise exactly when
+  # dev >= gap: rows 1 (0.25 vs 0.25, a razor's edge), 2, 4 and 8. 0.25 excuses
+  # precisely {1, 2, 4, 8} and nothing else -- it is the largest golden gap the
+  # measured deviation can bridge, and it excuses no position the deviation
+  # cannot. Row 5's gap is 0.375 against a deviation of 0.25 and stays graded;
+  # so do rows 3, 6, 9, 10.
+  #
+  # NO HEADROOM MULTIPLE IS APPLIED, and that is deliberate: unlike every other
+  # band in this file, this one LOOSENS as it grows. It is set at the smallest
+  # value that admits the honest reference, not at a multiple of it.
+  #
+  # WHAT IT COSTS: 4 of 11 prefill positions are ungraded on decisiveness, up
+  # from 2 at 0.1875. All four are in the image region or adjacent to it (the
+  # placeholders occupy indices 1-4) or are position 8, and a token whose
+  # embedding was overwritten by the vision tower has no text-token identity to
+  # predict from, so a near-uniform next-token distribution there is expected.
+  # ALL EIGHT DECODE POSITIONS REMAIN GRADED: their gaps are
+  #     0.75  3.5  10.5  9.9375  5.25  10.3125  0.75  8.9375
+  # and the smallest, 0.75, is 3x this margin. The fp32 tier is unaffected --
+  # `fp32_thresholds` declares no `argmax_margin`, so it grades at
+  # FP32_EXACT_THRESHOLDS' 0.0 (every position decisive) and all eleven agree.
+  #
+  # RE-MEASURED ON THIS INSTANCE AND IT IS EXACTLY THE FLOOR --
+  # headroom 1.00x, the tightest number in this file. Reported rather than
+  # routed around.
+  #
+  # The floors sweep walks a margin LADDER and counts, at each rung, the rows
+  # whose top-1 disagrees with the reference while their own top1-top2 gap is at
+  # or above that rung (`n_bad`). Over 26 graded logit comparisons:
+  #     margin   rows_with_a_bad   decisive rows graded
+  #       0.0          2                  101
+  #       0.125        2                   98
+  #       0.1875       2                   96
+  #       0.25         0                   85   <- declared
+  #       0.375        0                   73
+  # So 0.25 is not a comfortable choice, it is the LOWEST value at which this
+  # instance is green, and 0.1875 -- what all three text-only chunked instances
+  # declare -- would make it red.
+  #
+  # THE TWO ROWS ARE ONE ROW. `chunked_prefill_logits` and
+  # `chunk_boundary_battery[interior]` both split sequence 0 at 5, so they grade
+  # the same six-row forward; one of those six has a cross-framework argmax
+  # disagreement at a gap in [0.1875, 0.25). It is an ordinary bf16 near-tie on
+  # a row that is not decisive -- centered cosine 0.999754, token KL 7.589e-03,
+  # zero exact ties -- and exempting it is precisely what this threshold is for.
+  # It is NOT a defect: the same forward agrees with an unchunked prefill to
+  # 0.0e+00 on torch and 6.485e-05 on jax at fp32 (see this file's header).
+  #
+  # LEFT AT 0.25 RATHER THAN RAISED, deliberately. 0.375 would buy 0.125 of
+  # absolute slack and cost 12 of the 85 decisive rows (-14%) that are currently
+  # graded, and the quantity it would be buying slack against is DETERMINISTIC:
+  # both graded pins are in force, the goldens are frozen, and three processes
+  # reproduced the family parent's own statistics bit-identically. The risk this
+  # accepts is a driver or jaxlib move, not run-to-run noise -- and if it ever
+  # fires it will present as a NUMERIC failure on
+  # `test_chunked_prefill_logits`, not as a threshold problem, so a reader
+  # arriving at that failure should come back here first.
+  #
+  # 0.25 IS ALSO THE FAMILY PARENT'S VALUE, independently arrived at. That is
+  # corroboration rather than inheritance: core_qwen2_5_vl measured it on a
+  # single-sequence 11-row VL prefill and this cell measures the same number on
+  # a three-request mixed batch with a chunk boundary in it.
+  argmax_margin: 0.25
+  # Minimum per-token CENTERED cosine, native tier -- the prefill logits, the
+  # image-conditioned prefill logits, the eight decode-step logits, and the two
+  # `test_decode_prefill_consistency` invariance legs. Hidden states have their
+  # own override below.
+  #   floor 3.9641e-03 -- (1-c), MEASURED on the native PREFILL logits, three
+  #                      processes bit-identical: 1 - 0.9960358738899231. THE
+  #                      BINDING ROW IS POSITION 0, `<|vision_start|>`, not an
+  #                      image row: the eleven per-row values are
+  #                        0.996036 0.998222 0.998539 0.999339 0.998667 0.999044
+  #                        0.999399 0.999537 0.999555 0.999863 0.999795
+  #                      i.e. the four `<|image_pad|>` rows (1-4) are the next
+  #                      four worst but position 0 -- which attends only to
+  #                      itself, the least-averaged logit row there is -- is 4x
+  #                      worse than any of them.
+  #   value 0.99       -- ratio 2.52x (budget 1.0e-2 over 3.9641e-3).
+  #
+  # THE CLASS-STANDARD 0.998 IS UNREACHABLE HERE (it is a 2.0e-3 budget against a
+  # 3.96e-3 requirement, i.e. the reference misses it by 2x), and 0.99 is still
+  # 2x tighter than the `bf16_native` profile default of 0.98 that would apply if
+  # this key were omitted. core_gpt_oss already declares 0.95, so a per-family
+  # value here is the class's normal behaviour rather than a new liberty.
+  #
+  # WHAT IT COSTS, disclosed rather than left implicit: one tier value serves
+  # four surfaces whose requirements span 15x. The eight decode-step rows need
+  # between 1.72e-4 and 5.34e-4 and the two invariance legs need 2.64e-4, so all
+  # ten are graded 19-58x looser than they require. There is no per-surface
+  # override for a LOGIT surface -- `_assert_logit_parity` calls
+  # `_centered_floor(thresholds, extras)` with no `surface` -- so this is a
+  # property of the harness, not a choice made here. It is the one place on this
+  # instance where the multimodal prefill's requirement visibly loosens a
+  # text-only surface.
+  centered_cosine_floor: 0.99
+  # `centered_cosine_floor.hidden_states` IS DELIBERATELY NOT DECLARED HERE, and
+  # that is a MEASUREMENT overturning an inheritance rather than an omission.
+  # The family parent declares 0.98 for it, but the floors sweep says this
+  # instance should not inherit the key.
+  #
+  # MEASURED with the floor plugin over the whole graded
+  # suite, reference as candidate, both graded pins. All 37 residual-
+  # stream layers, centered cosine, native tier:
+  #     layers 0-30   0.99985 .. 1.00000
+  #     layer  31     0.99971   <- the family parent's own worst layer
+  #     layers 32-35  0.99970 .. 0.99978
+  #     layer  36     0.99948   <- THIS instance's worst
+  #   worst = hidden_36, 1 - c = 5.2369e-04
+  #     against the TIER floor 0.99 (what this instance falls back to): 19.10x
+  #     against the surface floor 0.98 (what the parent declares):      38.19x
+  #
+  # SO THE FALLBACK IS TIGHTER AND STILL CLEARS BY 19x, which is exactly the
+  # condition ragged_qwen3 recorded for removing this same key: "the name was
+  # removed again ... silence is the right answer only because the fallback is
+  # TIGHTER, not looser". Declaring 0.98 would ship 2x the necessary slack on
+  # the one surface a per-surface override exists to keep discriminating.
+  #
+  # AND THE PARENT'S MECHANISM DOES NOT REPRODUCE ON THIS BATCH, which is the
+  # substantive finding rather than a threshold preference. core_qwen2_5_vl
+  # measures `hidden_31` at 0.9910509 -- BELOW the tier floor -- because its
+  # residual stream peaks at 2240 and then collapses to |ref| 64 at layer 31
+  # while a one-ULP error does not shrink with it. This instance measures the
+  # same layer at 0.99971, 32x closer, because its graded forward is a MIXED
+  # BATCH: ten rows drawn from three requests, only six of which are the
+  # image-bearing sequence's, so the row that carries the massive activation is
+  # no longer the row the centered cosine is dominated by. The collapse is a
+  # property of a particular row, not of the checkpoint, and a mixed batch
+  # dilutes it. That is why this key is a per-INSTANCE decision and not a
+  # per-family one, and why inheriting it across the mode axis would have been
+  # wrong in the loose direction.
+  #
+  # CONSEQUENCE FOR THE SYMMETRY GATE: this instance is NOT added to
+  # `test_inference_instance_symmetry._WAIVERS`' list for this key, because it
+  # does not declare it. Nine of fifteen instances now omit it.
+  # SEQUENCE-LEVEL decisiveness, read by `test_behavioral.test_greedy_sequence`
+  # on the free-running native generation.
+  #   floor 0        -- THE NATIVE FREE-RUNNING SEQUENCE MATCHES THE GOLDEN
+  #                     EXACTLY at all 8 generated steps, on all three runs
+  #                     (tokens 13753 9334 151645 198 151644 198 151644 198), so
+  #                     this band was never consulted -- the check returns before
+  #                     reading it. There is no observed divergence to excuse.
+  # THE EIGHT GENERATION-ALIGNED GOLDEN MARGINS (the prefill row's own gap, then
+  # decode steps 0..6): 0.75  0.75  3.5  10.5  9.9375  5.25  10.3125  0.75
+  # THE LARGEST CROSS-PORT DEVIATION AT THE GOLDEN'S OWN TOP-2 COLUMNS, per
+  # generated step:                          0.0   0.125  0.25  0.0  0.25  0.25  0.125  0.25
+  #   mechanism bound 0.25 -- and at EVERY one of the eight steps the deviation
+  #                     is strictly smaller than that SAME step's own golden
+  #                     margin (0.0<0.75, 0.125<0.75, 0.25<3.5, 0.0<10.5,
+  #                     0.25<9.9375, 0.25<5.25, 0.125<10.3125, 0.25<0.75), so no
+  #                     step is reachable by this port's measured noise at any
+  #                     margin up to the smallest golden margin, 0.75.
+  #   value 0.125    -- class-standard value; 6x below the smallest golden margin
+  #                     and 2x below the mechanism bound. Inert on this
+  #                     checkpoint, kept at the class value and disclosed rather
+  #                     than pretended tighter.
+  # NOTE THIS IS THE ONE PLACE THE POSITION-LEVEL `argmax_margin` ABOVE AND THIS
+  # KEY DIVERGE IN DIRECTION: position 8 of the PREFILL row flips, but position
+  # 10 -- the row that generates token 0 -- does not, so the free-running
+  # sequence never sees the flip. That is why one band had to move and the other
+  # did not.
+  decisive_margin: 0.125
+  # PER-SURFACE absolute bands. `check_array`'s abs term is a fixed quantity and
+  # this tier's arrays are not on one scale: the isolated attention output peaks
+  # at 2.94, the KV cache at 93.8, the residual stream at 2240 -- a 762x spread.
+  # The tier default (0.1) grades the attention op (native `paged_attention`
+  # needs a NEGATIVE band -- the rel term alone covers it) and the two wide
+  # surfaces name their own.
+  #
+  #   abs_tol.kv_cache_state
+  #     floor 0.38308 -- MEASURED, `max_i(|d_i| - 0.1*|ref_i|)`, three processes
+  #                     bit-identical; raw max|d| is 0.5 against a peak of 93.78,
+  #                     over 1 179 648 elements. Between core_qwen3's 0.6266 and
+  #                     core_llama3's/core_qwen2's 0.5-declared surfaces; this
+  #                     checkpoint's cache is only two kv-heads wide (GQA 16:2)
+  #                     so there are four times fewer elements per layer than
+  #                     core_qwen3's to find a worst case in.
+  #     value 2.0     -- ratio 5.22x. Same value core_qwen3 declares, which here
+  #                     is a coincidence of two independent measurements landing
+  #                     in the same decade rather than an inheritance.
+  abs_tol.kv_cache_state: 2.0
+  #   abs_tol.hidden_states
+  #     THE DECLARED VALUE IS NOT SET FROM THE SHALLOW END, AND ON THIS INSTANCE
+  #     IT IS NOT SET FROM THE DEEP END EITHER -- it is set from ONE LAYER,
+  #     `hidden_31`, and that is the finding. `_shallow_abs_cap` rescales the
+  #     declared band per layer by `MARGIN * declared * running_peak_i /
+  #     global_peak` and `_assert_array_parity` clamps it to `declared`, so the
+  #     requirement each layer places on `declared` is
+  #     `needed_i / min(1, 4 * running_peak_i / global_peak)`. Measured across
+  #     all 37 layers, the five largest:
+  #       hidden_31  11.2000   <- BINDS   (clamped; needed_abs 11.2 outright)
+  #       hidden_0    6.2410              (capped at 0.01853 of declared)
+  #       hidden_33   4.5750
+  #       hidden_32   4.5500
+  #       hidden_35   4.2500
+  #     every other layer needs <= 1.74, and layers 3-30 need <= 0.49.
+  #     floor 11.2000 -- hidden_31, three processes bit-identical.
+  #     value 24.0    -- ratio 2.143x, the WORST-LAYER ratio across all 37
+  #                     (hidden_0 clears at 3.85x, hidden_33 at 5.25x, and every
+  #                     layer from 3 to 30 at more than 48x). Comparable with
+  #                     core_qwen3's own 2.59x on the same key.
+  #     `_HIDDEN_STATE_CAP_MARGIN` (4.0) is NOT the binding constraint here: the
+  #     margin this instance actually requires, `needed_i / (declared *
+  #     running_peak_i / global_peak)` at declared 24.0, is 1.040 at hidden_0 --
+  #     inside the four shipped instances' 0.100 / 0.126 / 0.350 / 1.222 range
+  #     and carrying 3.85x of the constant. No template change is implied.
+  #
+  #     TWO POPULATIONS SHARE THIS ONE BAND, AND ON A VL INSTANCE THEY ARE NOT
+  #     THE SHALLOW AND DEEP ENDS -- they are the TEXT ROWS AND THE IMAGE ROWS OF
+  #     THE SAME TENSOR. Measured per row at `hidden_0`:
+  #       the SEVEN TEXT rows     max|d| = 0.0 EXACTLY, |ref| <= 0.1001
+  #       the four IMAGE rows     max|d| 0.125-0.1875, |ref| 6.75-10.375
+  #     Seven and four, summing to the prompt's eleven: the placeholders occupy
+  #     indices 1-4 and the text rows are 0 and 5-10. (Row 0,
+  #     `<|vision_start|>`, is a text row with |ref| 0.10009766, the same
+  #     population as row 5, so the count is seven text rows, not six.)
+  #     The image rows are ~100x the text rows in magnitude and carry ALL of the
+  #     disagreement, so the shallow cap -- 4 * 24.0 * 10.375 / 2240 = 0.4446 at
+  #     the declared value -- is 4.44x the text rows' entire dynamic range and
+  #     grades nothing on them elementwise.
+  #     THAT IS A REAL COVERAGE GAP AND IT IS NOT CLOSEABLE BY CHOOSING A
+  #     DIFFERENT NUMBER: any band that admits the image rows is vacuous for the
+  #     text rows, because `_shallow_abs_cap` scales along DEPTH and there is no
+  #     per-ROW scaling in the comparator. What grades the text rows instead is
+  #     the per-row centered cosine (`F.centered_cosine` takes the MINIMUM over
+  #     rows, and a zeroed or constant row scores 0.0 since the `_formulas` fix),
+  #     which reads exactly 1.000000 on all seven. That clause is not
+  #     decoration: the minimum is over ROWS, so a single text row going
+  #     degenerate or changing direction fails it on its own, at 0.98.
+  #
+  #     AND THE POPULATIONS SWAP BY DEPTH, which is why "the image rows are the
+  #     problem" is only true at the shallow end. At `hidden_31`, the layer that
+  #     BINDS, the four image rows need 0.159-0.503 and the binding row is TEXT
+  #     row 0 at 11.2 -- 22x the worst image row. A calibration that had looked
+  #     only at hidden_0 would have set this band at 6.24 and failed five layers.
+  abs_tol.hidden_states: 24.0
+
+# core_llama3's six points in SHAPE -- same transforms, same co-activations, same
+# greedy point -- with all THREE top_p values chosen here rather than inherited.
+#
+# THE SCREEN. Rather than ship three unchecked values, the three
+# predicates were run directly, importing `_grid_probe`, `_bf16_round` and
+# `_MIN_TOP_P_MARGIN` from the harness rather than
+# reimplementing them.
+#
+# THE FINDING THAT SHAPED THESE VALUES, and it is the one worth carrying to the
+# next family: A `top_p` VALUE IS NOT TRANSFERABLE ACROSS FORWARD IMPLEMENTATIONS,
+# AND NO AMOUNT OF MASS-MARGIN HEADROOM MAKES IT SO. The argument that "a point at
+# 1.07x can cross the floor under an ULP, one at 73x cannot" is true of the
+# mass-margin clause but IRRELEVANT
+# to the tie clause, which is a discrete equality with no margin to bank. Measured
+# directly: a `top_p` of 0.87 on this grid's `{t: 1.0, k: 50}` point had a 125x mass
+# margin on one row and cut INSIDE AN EXACT TIE on another. Headroom on the
+# continuous clause buys nothing on the discrete one.
+#
+# THE CANONICAL ROW NOW EXISTS AND THE SCREEN HAS BEEN RE-RUN AGAINST IT.
+# the freezer freezes this instance end to end, and
+# `golden/sampler.npz::logits` -- which is bit-identical to
+# `prefill_forward.npz::logits[-1]`, verified -- is THE row every one of these
+# three predicates cuts. It is the `mrope + image` arm: argmax 13753, top-1
+# probability 0.164431.
+#
+# DO NOT SCREEN AGAINST THE OLDER 0.1718 READING FOR THAT ARM. The canonical
+# probability is 0.164431; the two share an argmax and the whole eight-token
+# continuation but differ in the probability by about one bf16 ULP at this
+# magnitude. The one input
+# choice that could have explained it has been eliminated: `image_processing
+# .preprocess` over `image_fixture.png` is bit-identical (max|d| == 0.0) to
+# `image_preprocess.npz`'s `pixel_values`. Do not re-screen against 0.1718, and
+# do not screen against a `transformers` row at all -- the two differ in 150217
+# of 151936 entries.
+#
+# WHAT THE RE-SCREEN FOUND, measured on that row by importing `_grid_probe`,
+# `_bf16_round` and `_MIN_TOP_P_MARGIN` from
+# the harness rather than reimplementing them:
+#
+#   grid[2] p=0.629   PASS   keep 13   mass margin 172.0x the 5.0e-05 floor
+#   grid[4] p=0.874   PASS   keep 20   mass margin  42.5x
+#   grid[5] p=0.934   FAIL   keep 19   cuts INSIDE AN EXACT TIE at logit
+#                                      24.10714340209961, and the kept and
+#                                      dropped logits both round to bf16 24.125
+#
+# So exactly one value had to move, the expected outcome rather than a defect.
+# 0.629 and 0.874 are re-screened and
+# UNCHANGED; only grid[5] is new.
+#
+# WHY 0.939 AND NOT ONE OF THE HIGHER-MARGIN CANDIDATES. Sweeping top_p over
+# [0.700, 0.999] at this point's own {t: 0.7, k: 0} and keeping only values that
+# clear all four predicates AND a `keep >= 4` floor:
+#
+#   p       keep   mass margin   k->p->t cells moved
+#   0.716      7       386.1x            12
+#   0.784      9       323.1x            21
+#   0.814     10       271.9x            33
+#   0.939     20        72.4x           626      <- CHOSEN
+#   0.934     19   (fails: tie + bf16 collision)  525
+#
+# The margin-maximising answers are all shallow cuts, and the criterion-3 column
+# is why they are refused: grid[5] is the ONLY point supplying the k->p->t
+# discrepancy (see CRITERION 3 below), and a cut keeping 7 tokens supplies 52x
+# less of it than one keeping 20. The `keep >= 4` floor rules out the degenerate
+# end -- a one-token mask is invariant under every permutation of the three
+# transforms, which would silently disable the clause criterion 3 protects -- and
+# above that floor the trade is margin against observability, not margin alone.
+# 72.4x is 5.7x the 12.7x worst case the previous intersection accepted, so this
+# is not a concession.
+#
+# IT SITS IN THE MIDDLE OF A PLATEAU, which is the robustness argument the
+# discrete clauses actually admit. Every p in [0.936, 0.943] keeps the same 20
+# tokens and cuts between the same two logits (24.107143 -> bf16 24.125 kept,
+# 23.571428 -> bf16 23.625 dropped); 0.939 is where the mass margin within that
+# plateau is largest. A cut that is only correct at one thousandth is a cut
+# waiting for the next re-freeze.
+#
+# THE OLD FIVE-ROW INTERSECTION IS RETIRED. It was a hedge against exactly this
+# day and it did its job: two of its three values survived the canonical row
+# unchanged. It is not restated here, because screening against four rows nobody
+# can now produce plus a `transformers` row that is not this reference would make
+# the next reader's job harder, not easier.
+#
+#   CRITERION 2  the cumulative-probability margin from the cut boundary must
+#                clear 5.0e-05 and the cut must not land between two EQUAL logits.
+#                On the canonical row: 172.0x, 42.5x and 72.4x.
+#   CRITERION 3  the grid must move at least one cell under BOTH (t,p,k) and
+#                (k,p,t) relative to the canonical (t,k,p). Measured PER POINT,
+#                not inferred from totals, on the canonical row:
+#                    grid[0] 0 / 0     grid[3] 0 / 0
+#                    grid[1] 0 / 0     grid[4] 30 / 0
+#                    grid[2] 0 / 0     grid[5] 0 / 626
+#                grid[4] supplies the entire t->p->k discrepancy and none of
+#                k->p->t (its top_k and top_p are co-active; its t=1.0 is inert
+#                wherever it sits); grid[5] supplies the entire k->p->t and none
+#                of t->p->k (temperature and the cumulative cut do not commute;
+#                its k=0 is inert wherever it sits); every other point
+#                contributes 0 to both. BOTH POINTS ARE REQUIRED -- dropping
+#                either leaves one direction dead, which is exactly the
+#                ragged_llama3 failure mode. Moving grid[5] from 0.934 to 0.939
+#                RAISED its contribution, 525 -> 626.
+#                A KEEP FLOOR WAS IMPOSED ON THE SEARCH (>= 4 surviving tokens)
+#                rather than maximising the margin: the highest-margin candidates
+#                were all shallow cuts, a one-token mask is invariant under every
+#                permutation of the three transforms, and the highest-headroom
+#                answer would have silently disabled the clause it was supposed to
+#                protect. See the plateau table above for what the floor cost.
+#   CRITERION 4  the token at the cut boundary and the one below it must not round
+#                to the IDENTICAL bf16 value, by explicit round-to-nearest-even on
+#                the fp32 bits and NOT inferred from the fp32 gap size. Measured
+#                separation on the canonical row: 1.0 ULP at grid[2], 3.0 at
+#                grid[4], 4.0 at grid[5]. This is the clause 0.934 failed --
+#                24.10714340209961 and 24.107143... straddling the cut BOTH round
+#                to 24.125 -- so it is also the clause that moved the value.
+#
+# WHY NOT core_llama3's OWN VALUES, since the shape is otherwise inherited: 0.905
+# and 0.87 were both tried and both cut inside an exact tie on a reference row.
+#
+# THE TAIL IS TIE-DENSE, AND NOT ONLY THE TAIL. Ties are what these three values
+# are dodging, so where they live matters. On a reference row the ties start at
+# rank 4: a bf16 logit row is tie-dense EVERYWHERE below the first few
+# ranks, tie density rises with depth, and there is no "safe region" --
+# only individual cut points that happen to land between two distinct values ON A
+# PARTICULAR ROW. grid[5] is this instance's own demonstration of it.
+#
+# IF THE ROW EVER MOVES AGAIN -- a re-freeze that changes the prompt, the image,
+# the geometry or the reference's arithmetic -- RE-RUN THIS SCREEN. It is two
+# minutes: load `golden/sampler.npz::logits`, import `_grid_probe`, `_bf16_round`
+# and `_MIN_TOP_P_MARGIN` from the harness, and
+# check all four criteria plus the keep floor at each point. The two static
+# guards (`test_no_sampler_grid_point_cuts_inside_a_tie`,
+# `test_no_top_p_boundary_collides_at_bf16`) will tell you it is needed; they
+# will not tell you which replacement to pick.
+# ===========================================================================
+# THE SAMPLER GRID, RE-SCREENED FOR THIS INSTANCE'S OWN ROW -- and the re-screen
+# was FORCED, not precautionary. Inheriting core_qwen2_5_vl's six points fails
+# two sampler-grid guard tests on this instance by name:
+#   test_the_sampler_grid_makes_chain_ORDER_observable  (k-vs-p 0, t-vs-p 0)
+#   test_no_two_sampler_grid_points_grade_the_same_thing
+#     (grid 2 {1.0, 0, 0.629} and grid 4 {1.0, 50, 0.874} collide)
+#
+# WHY THE FAMILY PARENT'S GRID CANNOT TRANSFER, which is the mode axis reaching
+# the sampler. The freezer's `step_sampler` takes the sampler's
+# input from `_prefill_last_logits`, i.e. `logits[-1]` OF THE GRADED FORWARD.
+# On `core` that is sequence 0's row; on a mixed batch it is the LAST REQUEST's,
+# which here is r2's ' fence' row -- and r2 was chosen for a large argmax margin
+# (5.0625) precisely so `test_batching_invariance` cannot coin-flip. A large
+# margin is a CONCENTRATED row, and a concentrated row is one an inherited
+# `top_p` cannot subdivide.
+#
+# MEASURED on the frozen `sampler.npz::logits` (provenance verified
+# bit-identical to `prefill_forward.npz::logits[-1]`), argmax 24650, max|logit|
+# 20.125, top-1 probability 0.945087 at T=1.0. Every inherited top_p collapses
+# it to ONE surviving token:
+#     {1.0, 0, 0.629}   -> 1 token      {1.0, 50, 0.874} -> 1 token
+#     {0.7, 0, 0.939}   -> 1 token
+# Three points grading a one-token mask is why two of them collided.
+#
+# THE SIX BELOW, screened with the sampler-grid screen. `surv` is survivors on
+# the GRADED row at
+# fp32; `k/p` and `t/p` are cells moved by the two ISOLATING swaps that make the
+# chain order observable:
+#
+#   grid  point                    surv  k/p  t/p  tie   fp32 slack   role
+#     0   {1.0, 0,  1.0}         151936    0    0  no          inf    class-wide identity
+#     1   {0.7, 50, 1.0}             50    0    0  no          inf    class-wide top_k
+#     2   {1.0, 0,  0.957811}         5    0    0  no       4182.2    pure top_p, keeps 5
+#     3   {0.0, 0,  1.0}         151936    0    0  no          inf    class-wide greedy
+#     4   {1.0, 50, 0.972968}         3   17    0  no       2832.0    k AND p co-active
+#     5   {1.2, 0,  0.812227}         5    0    4  no       9354.9    T != 1 AND p co-active
+#
+#   ORDER OBSERVABILITY, whole set, graded row, fp32: k-vs-p 17 cell(s),
+#   t-vs-p 4 cell(s) -> OBSERVABLE. Rows 4 and 5 are what buy it and neither is
+#   decoration: without row 4 a reordered `t->p->k` grades identically, and
+#   without row 5 a reordered `k->p->t` does.
+#
+# THE THREE NON-TRIVIAL top_p VALUES ARE DERIVED, NOT GUESSED. Each is the
+# midpoint of the open interval that keeps exactly N tokens on this row --
+# (cum[N-2], cum[N-1]] of the sorted softmax -- so it sits as far from both
+# cut boundaries as the geometry allows rather than near one of them:
+#     0.957811 = mid(0.956564, 0.959057]  keeps  5 at T=1.0
+#     0.972968 = mid(0.972764, 0.973171]  keeps 20 at T=1.0 before top_k,
+#                                         3 after top_k=50 renormalises -- which
+#                                         IS the k/p interaction row 4 exists for
+#     0.812227 = mid(0.809438, 0.815015]  keeps  5 at T=1.2
+#
+# ALL SIX ARE SAFE ON THE GRADED ROW at both dtypes: no tie straddles the cut,
+# and the smallest fp32 cumsum slack is 2832x. THAT IS THE ROW THE GRADED SUITE
+# SCORES, and it is the criterion this grid is chosen against.
+#
+# TWO ARE FLAGGED UNSAFE ON THE **PARITY** ROW, AND THAT IS A REAL TENSION RATHER
+# THAN AN OVERSIGHT -- report it, do not paper over it. The screen also checks
+# sequence 0's own row ("The picture shows a bright"), which is what
+# the parity checks feed their sampler legs. That row is FLAT (top-1
+# 0.164) where the graded row is CONCENTRATED (top-1 0.945), so the two want
+# OPPOSITE top_p: the parity row needs an aggressive cut to avoid ties in its
+# long flat tail, and the graded row needs >= 0.9451 to keep more than one token
+# at all. On `core` they are the same row and no tension exists; a mixed-stage
+# batch is the first place they diverge, and no single grid can be optimal for
+# both. Points 2 and 5 keep 1495 / 944 tokens on the parity row at fp32 and hit
+# a native tie there.
+#   MEASURED CONSEQUENCE, which is why this is a tension and not a defect:
+#   the parity checks run GREEN on this grid, 28/28, including
+#   `test_sampler_transforms_agree_at_the_native_dtype` -- 2 mask disagreements
+#   over 6 grid rows, worst surviving-value diff 0.000e+00. The native tier
+#   already tolerates mask disagreement for exactly this reason; the fp32 tier
+#   has 0.
+sampler_grid:
+  - {temperature: 1.0, top_k: 0,  top_p: 1.0}
+  - {temperature: 0.7, top_k: 50, top_p: 1.0}
+  - {temperature: 1.0, top_k: 0,  top_p: 0.957811}
+  - {temperature: 0.0, top_k: 0,  top_p: 1.0}
+  - {temperature: 1.0, top_k: 50, top_p: 0.972968}
+  - {temperature: 1.2, top_k: 0,  top_p: 0.812227}
+# A CLASS-WIDE CONSTANT, 5 on every instance. Not a per-instance knob: tuning it
+# to dodge a bf16 rank tie in the top-N would trade one instance's problem for a
+# class-consistency problem, and core_qwen3 recorded that argument in full.
+logprobs_top_n: 5
+# RAISED OFF THE CLASS VALUE (900) BY A MEASUREMENT, which is the condition the
+# family parent's own note set for moving it: "if a graded run's `generate()`
+# ever approaches it, raise it as a measurement rather than pre-emptively". It
+# did not approach it -- it EXCEEDED it.
+#
+# MEASURED with the oracle grading run for chunked_qwen2_5_vl, the GPU
+# idle throughout: the candidate sandbox was killed at 901 s against the
+# 900 s budget and the session ended UNSCORED (pytest exit 4, no reward.json --
+# `_require_*`'s machine verdict, deliberately not a zero).
+#
+# WHAT THIS BUDGET ACTUALLY BOUNDS, because the name is misleading and the
+# grader's own message says so: it is the WHOLE-SANDBOX budget for the ONE
+# worker spawn that runs every probe in REQUIRED_PROBES -- both prefills,
+# decode, both generations, `serve.py::_build`, held-out scoring over 25
+# prompts, BOTH battery axes and every invariance -- not the candidate's
+# `generate()` loop alone.
+#
+# WHY THIS CELL NEEDS MORE THAN EITHER PARENT, and it is the two axes adding
+# again rather than anything pathological:
+#   * the FAMILY is the largest checkpoint in the class outside gpt_oss (7.52 GB,
+#     3.1x core_llama3) and builds a VISION TOWER on top of the decoder, so every
+#     model construction in the sandbox pays both. ragged_qwen2_5_vl's whole
+#     graded pytest measures 444-478 s.
+#   * the MODE adds four graded checks and a SECOND battery axis
+#     (`chunk_boundary`, four more variants), measured at +84 s on llama3
+#     (chunked_llama3 386.8 s against ragged_qwen2 302.3 s, adjacent pair).
+#
+# THE HOST WAS NOT QUIET AND SAYING SO IS THE POINT. 1-min load average read
+# 268.73 (5-min 241.70, 15-min 174.57) during the timed-out run; the GPU was
+# idle (1 MiB, 0%) and the contention is CPU, which is what the sandbox's
+# checkpoint conversion and two `serve.py::_build` calls are bound by. The
+# grader's own timeout message anticipates exactly this -- "the honest reference
+# needs a large fraction of it, so on a loaded host this fires on a CORRECT
+# port" -- so 1800 is chosen to survive THAT condition rather than to fit a
+# quiet-box measurement that has not been taken.
+#
+# 1800, NOT 3600: `[verifier] timeout_sec` is 3600 for this task, so the sandbox
+# budget stays
+# strictly inside the verifier's with 2x to spare -- a sandbox budget at or above
+# the verifier's would mean a hung port is caught by the OUTER timer, which
+# writes no reward.json at all, instead of by the inner one, which fails only the
+# checks that read the sandbox.
+generate_timeout_s: 1800
+
+compare_hidden_states: true
+# UNMEASURED MARKER AT AUTHORING TIME, replaced by the collected count below.
+# the oracle grading run asserts `n_passed == graded_checks` and
+# `conftest._require_complete_collection` floors the collected count against it,
+# so this number has to be what the suite actually collects and nothing else.
+#
+# THE ARITHMETIC THIS CELL PREDICTS, stated first so the measurement can refute
+# it. The two axes are additive on every cell that has shipped:
+#     core     33      ragged   37  (+4)      chunked  41  (+8)
+#     +qwen2_5_vl                     +6      (the multimodal set)
+#   core_qwen2_5_vl   33 + 6 = 39   MEASURED 39
+#   ragged_qwen2_5_vl 37 + 6 = 43   MEASURED 43
+#   chunked_qwen2_5_vl 41 + 6 = 47  <- this cell
+#
+# The eight `chunked` adds over `core` are `test_ragged_forward_logits`,
+# `test_batching_invariance`, `test_no_cross_sequence_leakage`,
+# `test_batch_composition_battery` (the four `ragged` brings) plus
+# `test_chunked_prefill_logits`, `test_chunking_invariance`,
+# `test_prefix_cache_invariance` and `test_chunk_boundary_battery`. The six the
+# family adds are `test_image_preprocess`, `test_smart_resize_targets`,
+# `test_vision_tower_units`, `test_mrope_positions`, `test_image_embedding_merge`
+# and `test_multimodal_prefill_logits`. None of the fourteen is gated on anything
+# the other axis decides -- the mode four read `has_chunked`/`has_ragged` off the
+# MODE LADDER and the family six read `multimodal` off meta -- which is why the
+# two axes add rather than interact.
+#
+# `test_decode_speed` IS NOT IN THIS COUNT, on the same grounds as both parents:
+# it is gated on `perf_graded AND has_perf_golden`, `perf.json` is frozen and
+# `perf_graded` is absent because no calibrated `perf_thresholds.delta` exists
+# for this class. See `perf_k_values`.
+graded_checks: 47
+
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden

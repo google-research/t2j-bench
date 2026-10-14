@@ -1,0 +1,17 @@
+# Verifier weight image: the torch-free grade env plus the same /data/{repo_id} as
+# t2j-model:{model}, copied from it rather than downloaded again (so no token is needed,
+# and conversions that need torch, e.g. falcon's .bin -> .safetensors, have already run).
+#   t2j-verifier-base -> t2j-verifier-model:{model} -> t2j-verifier:{method}-{model}
+# Build: base_image/build_base_images.sh <model>   (builds t2j-model:{model} first)
+ARG MODEL
+FROM t2j-model:${MODEL} AS weights
+
+FROM t2j-verifier-base:latest
+
+ARG MODEL_REPO
+
+# Byte-identical to the agent side's /data.
+RUN test -n "$MODEL_REPO" || { echo "MODEL_REPO build-arg is required" >&2; exit 1; }
+COPY --from=weights /data/${MODEL_REPO} /data/${MODEL_REPO}
+
+WORKDIR /workspace

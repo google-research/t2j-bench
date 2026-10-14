@@ -1,0 +1,1362 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Per-instance source of truth for tasks/ragged_qwen3.
+# the freezer mirrors every value here into
+# golden/meta.json; nothing per-instance is hardcoded in the grader.
+#
+# THE CROSS-PRODUCT CELL: `qwen3` (the family column, from core_qwen3) x
+# `ragged` (the mode column, from ragged_llama3). This file is core_qwen3's
+# instance.yaml with SIX parsed values changed, and no others. A parsed diff
+# (`yaml.safe_load` both files, compare key sets and values) returns exactly:
+#   mode           core -> ragged   (the axis)
+#   max_num_seqs   1    -> 3        (forced by the axis)
+#   num_pages      8    -> 12       (forced by the axis)
+#   sequences      absent -> the three-sequence block (added by the axis)
+#   graded_checks  33   -> 37       (the four checks the axis deselects on core)
+#   sampler_grid   two `top_p` fields re-swept -- NOT forced by the axis
+#                  directly, forced by what the axis does to the ROW the
+#                  sampler is frozen on. See the `sampler_grid` banner: the
+#                  inherited grid was measurably dead here (0 cells on one
+#                  order axis, one point collapsed to a single token).
+# Each of those says below why it is not free. Everything else is held at
+# core_qwen3's on purpose: two axes moving at once is not a measurement, and
+# the value of this cell is that it isolates what `ragged` costs on a family
+# that is not llama3. `sampler_grid` is the one place that ideal could not be
+# met, and it is held single-variable as far as the row permits -- only two
+# `top_p` values moved; temperature, top_k and the point count are still
+# core_qwen3's.
+#
+# WHAT IS *NOT* INHERITED, and this is the one place the transliteration would
+# have been silently wrong: the two extra sequences' PROMPTS. ragged_llama3's
+# three sequences are 12 / 6 / 9 tokens INCLUDING llama3's BOS; Qwen3's
+# tokenizer prepends none, so the same three strings come out 11 / 5 / 8.
+# MEASURED, not predicted (transformers 5.4.0, self-checked
+# against core_qwen3's own frozen ids): ragged_llama3's sequence-2 text "The
+# quick brown fox jumps over the lazy" is [785, 3974, 13876, 38835, 34208, 916,
+# 279, 15678] -- EIGHT tokens on this checkpoint, which fits in ONE page and
+# destroys the two-page property that is the only thing making
+# `ragged_block_table_off_by_one_row` discriminate. New text was screened
+# instead; see the `sequences` block for the counts and the measured gaps.
+mode: ragged            # was `core` on core_qwen3 -- THE ONLY AXIS THAT MOVES
+model: qwen3
+model_name_or_path: Qwen/Qwen3-0.6B
+
+# Graded precision profile. HELD FIXED at core_qwen3's. Two frameworks running
+# independent kernels never agree bit-for-bit in reduced precision, so parity is
+# pinned at two precisions with different tolerances.
+precision_profile: bf16_native
+dtype: bfloat16
+
+# HELD FIXED at core_qwen3's.
+seed: 42
+
+# ===========================================================================
+# Paged KV geometry. THIS IS WHERE THE MODE AXIS ACTUALLY MOVES.
+#
+# core_qwen3 runs `max_num_seqs: 1`, which makes the compiled bucket and the
+# occupancy coincide: `seq_lens` has one entry either way, `query_start_loc`
+# has two, and `padded_num_reqs` is 1. Three sequences is the smallest batch
+# that is genuinely mixed AND has more than one request in one of the two
+# stages, so every bucketed field is strictly wider than its occupancy and
+# `test_static_shape_bucketing`'s four clauses all discriminate (its docstring
+# says exactly this: "On a `ragged` or `chunked` instance, where
+# max_num_seqs > 1, all four discriminate").
+#
+# The two relations config.py::RunConfig.__post_init__ ENFORCES:
+#   pages_per_seq * page_size >= max_model_len   ->  4 * 8 = 32 >= 32
+#   num_pages >= max_num_seqs * pages_per_seq    ->  12 >= 3 * 4
+# `num_pages` therefore rises 8 -> 12 WITH `max_num_seqs`; it is not a free
+# choice, and 12 is the smallest pool that honours the block table this
+# geometry advertises.
+#
+# HELD FIXED at core_qwen3's (which holds them at core_llama3's): `page_size`
+# 8, `pages_per_seq` 4, `max_model_len` 32. See core_llama3's own comments for
+# why page_size is 8 and not 16 and why max_model_len is 32; a mode change is
+# not an excuse to also vary the geometry.
+# ===========================================================================
+page_size: 8
+num_pages: 12           # was 8 -- forced up by max_num_seqs, see above
+max_num_seqs: 3         # was 1 -- the mode axis
+pages_per_seq: 4
+max_model_len: 32
+
+# THE FROZEN PAGE ASSIGNMENT for sequence 0 -- deliberately NOT the
+# identity, and HELD FIXED at core_qwen3's [2, 0, 3]. Under an ascending
+# assignment `slot == pos`, so a port that ignored `block_tables` entirely and
+# indexed the cache flat would reproduce `kv_cache_state.npz` exactly. Every
+# sequence below pins its own non-identity list; this key is sequence 0's, kept
+# at top level because `_decode_slot`, `test_block_table_contract` and
+# `validate_geometry` all read the single-sequence pin and sequence 0 is what
+# they describe. the freezer requires exactly
+# ceil((prompt_len + num_decode_steps) / page_size) = ceil((11 + 8) / 8) = 3
+# ids -- not `pages_per_seq` (4) -- with none repeated, none at page_ids[i] == i
+# and every one in [0, num_pages); [2, 0, 3] satisfies all four here too, and
+# the mode change does not move the page count.
+page_ids: [2, 0, 3]
+
+# The K sweep. FOUR legs -- three fitting points once
+# `fit_step_time` drops call 1, the minimum at which it has a degree of freedom
+# to see a bad call in. `num_decode_steps` (8) MUST be one of these four:
+# `perf_probe` samples `tokens` -- the work gate's subject -- only on that leg,
+# and the gate silently gets `None` if the coupling breaks.
+#
+# BYTE-IDENTICAL TO core_qwen3's, AND THAT IDENTITY IS LOAD-BEARING, not
+# incidental tidiness: the family-vs-mode comparison this instance exists to
+# make is only a single-variable one if the sweep does not move with it.
+#
+# Feasibility RE-DERIVED for this instance's own geometry (the numbers happen
+# to be unchanged, because `perf_probe` -- like the `generation_probe` it is
+# modelled on -- runs a single-sequence `Engine.generate` over the TOP-LEVEL
+# `prompt_ids`, i.e. sequence 0, not the mixed batch below): the sweep's own
+# page assignment is NOT frozen (`USE_FROZEN_ALLOCATION["perf"] = False`), so
+# the only thing that has to fit is the COUNT:
+#   ceil((prompt_len 11 + 16) / page_size 8) = ceil(27/8) = 4 <= pages_per_seq
+#     (4), no headroom, and
+#   11 + 16 = 27 <= max_model_len (32).
+# `num_pages` rising to 12 does not enter either inequality -- `pages_per_seq`
+# is the per-sequence cap and it did not move.
+# the harness enforces both, per instance.
+perf_k_values: [2, 4, 8, 16]
+
+# Canonical probe -- sequence 0, and the SAME 11 tokens core_qwen3 freezes.
+# HELD FIXED, and this is the load-bearing kind of fixed: the generation,
+# decode-step, perf, serve and held-out probes are single-sequence on EVERY
+# mode, so holding this prompt fixed is what makes the mode comparison mean
+# anything and nothing else.
+#
+# THE SAMPLER PROBE IS NOT IN THAT LIST ON THIS MODE.
+# `candidate.py::sampler_probe` grades
+# the FROZEN ROW, which is `prefill[-1]` -- on `core` that is sequence 0's last
+# prompt row, but on a ragged batch `query_start_loc` is [0, 11, 12, 13], so
+# row 12 is SEQUENCE 2's single decode token. The `sampler_grid` banner below
+# measures that row and re-sweeps against it; the threshold banner at
+# "WHICH ROWS THE MODE AXIS CAN EVEN MOVE" already classifies it correctly.
+# Holding this prompt fixed therefore does NOT hold the sampler's input fixed.
+#
+# The prompt is "The capital of France is Paris, and the capital of" -- the
+# same text core_llama3 and core_qwen3 use, truncated mid-phrase onto a
+# strongly determined continuation so top-1 agreement means something rather
+# than being a coin flip. Qwen3's tokenizer prepends no BOS, so this is 11
+# tokens where core_llama3's is 12. It is pinned here, as token ids, because
+# the freezer must not depend on a tokenizer.
+#
+# SCREENED against the three geometry criteria on the
+# real torch_orig reference: all 8 greedy decode margins clear the 0.125 floor
+# (tightest 0.5, 4x over), and SEVEN OTHER CANDIDATES WERE TRIED AND REJECTED
+# before it, three of them on an EXACT 0.0 top1-top2 gap -- see core_qwen3's
+# own file for the full record. THOSE numbers are a
+# property of the checkpoint and of THIS prompt, both of which this instance
+# holds fixed, so they are cited rather than re-run here; what IS re-measured
+# here is this prompt's gap INSIDE the mixed batch (see `sequences` below).
+#
+# THE SAMPLER-GRID CRITERIA ARE NOT INHERITED FROM core_qwen3. The grid is
+# screened against `prefill[-1]`, which on a ragged batch is sequence 2's decode
+# token and not this prompt at all, so the inheritance does not hold, and the
+# screening is re-run here. THE SHIPPED GRID MOVES 6 CELLS UNDER (t,p,k) AND
+# 6 UNDER (k,p,t), all four criteria re-measured on this instance's own frozen
+# row; the full table is in the `sampler_grid` banner below.
+prompt_len: 11
+num_decode_steps: 8
+prompt_token_ids: [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 6722, 315]
+
+# ===========================================================================
+# THE MIXED BATCH -- the only thing `ragged` adds to the scenario, and the
+# reason four graded checks that deselect on `core` apply here.
+#
+# `request_distribution` is [n_decode, n_prefill, n_mixed] and
+# `test_ragged_forward_logits` refuses a scenario with a zero in either of the
+# first two slots: "a `ragged` scenario with a zero decode count is a prefill
+# scenario wearing the wrong label". Two decode + one prefill gives [2, 1, 0].
+#
+# A `decode` sequence contributes exactly ONE query token (its last) and a
+# `seq_len` equal to its FULL length, so its query attends to KV that this
+# forward did not write. That is the whole difference between a decode request
+# and a prefill request, and it is why the freeze runs a WARM-UP forward first
+# (`inputs.npz`'s `warmup_*` arrays) that prefills every decode sequence's
+# prefix. Without it a "decode" request would attend to an empty cache and the
+# distinction would be a label rather than a computation.
+#
+# sequences[0] is sequence 0 above, RESTATED EXACTLY (`validate_sequences`
+# refuses anything else) so every single-sequence key keeps a defined meaning
+# instead of silently being read as element 0 of a list.
+#
+# WHY THE OTHER TWO HAVE THE LENGTHS THEY DO -- the lengths were chosen from
+# the geometry FIRST and the text found to fit them second, which is the order
+# that matters:
+#   sequence 1 (5 tokens, 1 page)  -- its decode token (position 4) sits on the
+#     SAME page as its prefix, which is the ordinary case.
+#   sequence 2 (9 tokens, 2 pages) -- 9 > page_size, so its decode token
+#     (position 8) is the FIRST token of its SECOND page. A block-table gather
+#     that is absent, reversed or off by one reaches a different page for this
+#     one token and for no other in the batch, which is the case a single-page
+#     sequence cannot produce. EXACTLY 9, not 9..16: at 9 the query token is
+#     the first token of page 2, the sharpest position for that discrimination.
+#
+# THE PAGE LISTS are ragged_llama3's, reused because they satisfy every rule
+# `validate_sequences` enforces at this IDENTICAL geometry and reusing them
+# keeps the two `ragged` instances comparable: {2,0,3}, {5} and {7,6} are
+# pairwise disjoint, all inside [0, 12), all non-identity (`page_ids[i] != i`)
+# for the same reason the top-level one is, and sequence 2's is REVERSED so a
+# table read in the wrong order is visible.
+#
+# THE BOS TRAP, MEASURED RATHER THAN PREDICTED. ragged_llama3's own three texts
+# do NOT transliterate onto this checkpoint. Its sequence-2 text, "The quick
+# brown fox jumps over the lazy", is 9 llama3 tokens (BOS + 8) and EIGHT qwen3
+# tokens -- which would fit in ONE page, silently reduce this batch's sharpest
+# request to the ordinary case, still freeze, still grade 1.0 and still look
+# right. Its sequence-1 text survives the same arithmetic (6 -> 5, still one
+# page), but that was checked rather than assumed. Both counts were measured
+# with `add_special_tokens=False` (transformers 5.4.0, tokenizers 0.22.2) --
+# which matches this class's own convention of encoding
+# `bos["qwen3"] = []` -- and only after a self-check re-encoded core_qwen3's own
+# prompt to its frozen ids EXACTLY, so the pinned tokenizer was verified
+# trustworthy on this family before anything was screened against it.
+#
+# AND BOTH EXTRA PROMPTS ARE TRUNCATED ONTO A STRONGLY DETERMINED CONTINUATION,
+# for exactly the reason `prompt_token_ids` above is -- restated here because
+# it is not optional on these two and ragged_llama3 MEASURED what happens when
+# it is ignored. `test_batching_invariance` compares the two legs' argmax with
+# NO tie-break latitude ("both rows are your own output under a transformation
+# that must not change the answer"), and `test_ragged_forward_logits` grades
+# the frozen forward at `argmax_margin`. On a row whose top1-top2 gap is at or
+# below one bf16 ULP both are coin flips. ragged_llama3 documents a case where
+# sequence 2's lone-leg row had a gap of EXACTLY 0.0 and a control mutation
+# that changes no value at all (`ragged_padded_tail_unmasked`) "caught" a check
+# by flipping the tie back. A check whose verdict a no-op can move is not a
+# check. The same failure mode is measured on THIS family independently:
+# core_qwen3 rejected three of its eight candidate prompts on an exact
+# 0.0 gap on this very checkpoint.
+#
+#   MEASURED (bf16, this checkpoint, the class resolved through the
+#   family registry to Qwen3ForCausalLM, driving solution/ref_jax_repo against
+#   this instance's own page geometry, inside t2j-inference-verifier:core-qwen3
+#   on one H100). BOTH GRADED PINS SET: JAX_DEFAULT_MATMUL_PRECISION=highest
+#   (the tool sets this itself) and XLA_FLAGS=--xla_gpu_autotune_level=0 (it
+#   does NOT -- you must pass it; see the reproduce line below and the
+#   determinism note under it). TWO CONSECUTIVE PINNED RUNS ON ONE GPU,
+#   BIT-IDENTICAL ON EVERY NUMBER PRINTED:
+#
+#                                             lone  batched  argmax  max|d|
+#     sequence 0  "...and the capital of"
+#                                 -> ' Italy'  0.625  0.625   15344  0.00000
+#     sequence 1  "Water freezes at zero degrees"
+#                                 -> ' Celsius' 3.750  3.750   61347  0.25000
+#     sequence 2  "In the beginning God created the heavens and the"
+#                                 -> ' earth'   3.125  3.250    9393  0.40625
+#
+#   ALL THREE REQUESTS AGREE between the lone leg and their row inside the
+#   mixed batch (`agree True`). `max|d|` is the worst element of the WHOLE
+#   151936-wide logit row, not the deviation at the top-2 columns, so the
+#   ratios below are conservative:
+#     sequence 0  max|d| is EXACTLY 0.0 -- the lone leg and the batched rows
+#                 are bit-identical, so there is no ratio to quote and none is
+#                 invented here. (This is the pin's doing: unpinned, the same
+#                 comparison reads 0.3125.)
+#     sequence 1  3.750 / 0.25000  = 15.0x clear
+#     sequence 2  3.125 / 0.40625  =  7.7x clear
+#   One bf16 ULP at the top-1 logits' own binade ([16, 32)) is 0.125, so
+#   sequence 1's deviation is 2 ULPs there; sequence 2's 0.40625 is not a whole
+#   multiple of it because the max is taken across the entire row, where the
+#   ULP changes with each binade. Neither decode gap is reachable by the
+#   batching noise `test_batching_invariance` is exposed to. Nothing here is a
+#   coin flip: the acceptance floor for the two NEW prompts was a lone-leg gap
+#   >= 1.0 and they clear it by 3.75x and 3.13x, and no gap is 0.0.
+#
+#   THE TOOL IS NOT DETERMINISTIC WITHOUT THE AUTOTUNE PIN, AND THAT IS A
+#   MEASURED PROPERTY OF THE TOOL, not of these prompts. Unpinned, two runs of
+#   the identical command in the identical image on the identical GPU disagree
+#   -- observed spreads: sequence 2's lone gap over 3.125 / 3.250 / 3.375, and
+#   sequence 0's batched gap over 0.625 / 0.750. The cause is the GEMM
+#   autotuner picking a different kernel for the same graph under different
+#   load. The LONE-LEG triple 0.625 / 3.750 / 3.125 is stable under the pin and
+#   is what this file documents; the `batched` and `max|d|` columns are the
+#   ones that move most, which is why they are quoted from the pinned runs
+#   only. Do not compare a number taken from this tool against one in this file
+#   without setting the pin first -- and note that this pin is not a special
+#   condition invented for the diagnostic, it is the SAME pin the graded path
+#   already sets, so pinning aligns the diagnostic with the grade.
+#
+#   SEQUENCE 0's 0.625 IS NOT core_qwen3's DOCUMENTED 0.5, AND THAT IS
+#   EXPECTED, not a discrepancy in this file: core_qwen3's nineteen frozen gaps
+#   are read off `environment/torch_orig`, while this diagnostic drives
+#   `solution/ref_jax_repo`. 0.625 - 0.5 is exactly ONE bf16 ULP at
+#   |logit| ~ 17.375, which is the cross-framework noise this whole class
+#   measures.
+#
+#   AND IT IS NOT AN ARTEFACT OF THE HARNESS -- cross-checked, under the same
+#   pin, two bit-identical runs against t2j-inference-verifier:ragged-llama3:
+#     ragged_llama3 LONE leg     0.375 / 4.375 / 4.0000  <- its documented triple,
+#                                                           reproduced exactly
+#     ragged_llama3 batched      0.375 / 4.375 / 3.9375
+#   So on llama3 the tool returns the documented numbers on the nose and the
+#   qwen3 shift is genuinely torch-vs-jax. READ THE COLUMN, THOUGH: that
+#   instance's comment documents LONE-leg gaps, and its third batched value
+#   (3.9375) is NOT its third documented value (4.000). Comparing the batched
+#   column against a documented lone-leg number is the specific mistake that
+#   makes this tool look like it fails to reproduce; it has already been made
+#   twice against ragged_llama3, on top of the unpinned drift above.
+#
+#   NO CANDIDATE WAS REJECTED ON A GAP. Both new prompts were screened for
+#   LENGTH first (the trap above), from a pool of six for slot 1 and five for
+#   slot 2, and the first length-legal primary of each pool passed the margin
+#   floor on the first measurement. The backups, had they been needed, were
+#   recorded with their token counts.
+#
+#   THESE NUMBERS ARE REPRODUCIBLE ONLY UNDER THE AUTOTUNE PIN; without it the
+#   run is not reproducible at all. A per-instance margin diagnostic re-derives
+#   THIS instance's gaps rather than inheriting ragged_llama3's, resolving the
+#   model class through the family registry and taking the instance as an
+#   argument.
+sequences:
+  - stage: prefill
+    page_ids: [2, 0, 3]
+    prompt_token_ids: [785, 6722, 315, 9625, 374, 12095, 11, 323, 279, 6722, 315]
+  # "Water freezes at zero degrees" -> " Celsius" (61347).
+  # 5 tokens, 1 page; decode token at position 4, on its FIRST page.
+  # MEASURED lone-leg top1-top2 gap 3.750 (batched 3.750, agree True; pinned).
+  # Same TEXT ragged_llama3 uses for its slot 1 -- the only one of its three
+  # that survives Qwen3's missing BOS with its page count intact (6 -> 5 tokens,
+  # still one page). Checked, not assumed.
+  - stage: decode
+    page_ids: [5]
+    prompt_token_ids: [28253, 93377, 518, 7168, 12348]
+  # "In the beginning God created the heavens and the" -> " earth" (9393).
+  # 9 tokens, 2 pages; decode token at position 8 = the FIRST token of page 2,
+  # which is the whole point of this slot.
+  # MEASURED lone-leg top1-top2 gap 3.125 (batched 3.250, agree True; pinned).
+  # NEW TEXT, not ragged_llama3's: its "The quick brown fox jumps over the lazy"
+  # is 8 tokens here and would collapse this sequence to a single page.
+  - stage: decode
+    page_ids: [7, 6]
+    prompt_token_ids: [641, 279, 7167, 4264, 3465, 279, 62780, 323, 279]
+
+# ===========================================================================
+# CALIBRATED NUMERIC BANDS.
+#
+# EVERY VALUE IN THE TWO BLOCKS BELOW IS STILL BYTE-IDENTICAL TO core_qwen3's,
+# AND EVERY ONE OF THEM NOW HAS A FLOOR MEASURED ON THIS INSTANCE RECORDED
+# BESIDE IT. Both halves of that sentence matter, and the honest version of the
+# second is the only defensible claim here: THE VALUES WERE NOT RE-DERIVED. A
+# `yaml.safe_load` diff of `fp32_thresholds` and `native_thresholds` against
+# core_qwen3/tests/instance.yaml returns IDENTICAL DICTS -- eleven keys, eleven
+# equal values -- and re-deriving any of them would have had to move
+# `golden/meta.json` with it. What IS defensible is that each of the eleven is
+# now backed by a floor taken HERE: the surface that binds it ON THIS INSTANCE,
+# the number the honest reference produces there, and the ratio.
+#
+# ragged_llama3's own header once implied the opposite -- it read "MEASURED ON
+# THIS INSTANCE, not inherited", which any reader takes as "these numbers differ
+# from core's", while its values were core_llama3's throughout. That error is
+# not repeated here in either direction: the values are inherited, the floors
+# are not, and the file says which is which on every line.
+#
+# WHAT WAS MEASURED: `solution/ref_jax_repo` as the candidate
+# against this instance's own frozen goldens (themselves frozen from
+# `environment/torch_orig`), on one H100, under exactly the graded
+# path's pins -- JAX_DEFAULT_MATMUL_PRECISION=highest,
+# XLA_FLAGS=--xla_gpu_autotune_level=0, seed 42. THREE independent runs, per the
+# class's worst-of-at-least-three convention. All 37 graded checks passed in all
+# three, so every floor below is a floor on a GREEN suite and not a diagnosis of
+# a red one.
+#
+# THE THREE RUNS WERE HOST-SIDE, against the tree on disk with both graded pins
+# set explicitly. The six in-container grades that BOUND these floors from above
+# (every one green at the declared values) do not MEASURE them: a green grade
+# says "floor <= declared", not what the floor is.
+#
+# SO A FOURTH RUN WAS TAKEN INSIDE `t2j-inference-verifier:ragged-qwen3`, same
+# two pins, the repo mounted read-only for the plugin and pytest pointed at the
+# image's own baked `/tests`. IT AGREES ON EVERY QUANTITY: all 50 array floors
+# including their binding INDICES, all 47 centred cosines, all 18 strict-logit
+# ladders, all four logprob rows and the margin list -- field for field against
+# the host runs, 37 passed / 10 deselected in 321.8 s. The environment therefore
+# does not move these numbers on this instance, which is the fact the convention
+# exists to establish; it is not an argument that it never could elsewhere.
+#
+# THE THREE HOST RUNS WERE BIT-IDENTICAL -- the instrument's JSON output is
+# `cmp`-equal across all three, covering 50
+# array floors, 47 centred cosines, 18 strict-logit ladders, 4 logprob rows and
+# the margin list. The in-container run is FIELD-equal rather than byte-equal,
+# only because the instrument gained four fields between the two (see the
+# `argmax_margin` block). There is no spread to quote, and that is a result
+# rather than an omission. Do NOT read it as cross-GPU or cross-process
+# stability: the two pins remove the GEMM autotuner and the fp32->TF32 default,
+# and no run moved the GPU.
+#
+# NONE OF THE FOUR WAS TAKEN ON A QUIET HOST, and that makes the result STRONGER
+# rather than weaker. The host ran under load across them; the three host runs'
+# own wall clocks span 294.4-356.6 s, 1.21x, and not one of the recorded
+# quantities moved. That is precisely the property `--xla_gpu_autotune_level=0`
+# buys, and it is what makes an unpinned number from this same tool non-quotable.
+# (The separate 1.19x figure quoted under `generate_timeout_s` is the SIX
+# in-container GRADES, a different run set; the two are not welded.)
+#
+# WHICH `tests/` TREE THEY WERE TAKEN ON, because a shared-template change can
+# move the row a band measurement reads. These floors were taken on the tests
+# tree AS SHIPPED.
+#
+# THE FLOORS DESCRIBE THE SAME GATES ON THE SAME NUMBERS ON A TEXT-ONLY FAMILY.
+# `_t2j/compare.py` holds `check_logits_strict`, `check_array`,
+# `NumericThresholds` and the cosine/KL clauses -- every gate a floor is a floor
+# OF. The metadata construction routes through `engine.default_input_positions`
+# (`jnp.arange(n, dtype=jnp.int32)`, bit-identical to the ascending int32 band
+# this family already builds) and `engine.default_model_inputs` (the identity on
+# the empty dict a text-only family passes), neither of which can move a number
+# here. CONFIRMED BY GRADE: the oracle grading run for ragged_qwen3 returns reward
+# 1.0 with 0 failed.
+#
+# HOW THE FLOORS WERE MEASURED. Every figure below comes from
+# one instrument, the floor plugin, a pytest PLUGIN that wraps
+# the graded suite's OWN gates (`test_numeric._assert_array_parity`,
+# `_t2j._formulas.centered_cosine`, `compare.check_logits_strict`,
+# test_behavioral's four logprob readers, `fixtures.Golden.decode_margins`) and
+# records what they saw. It re-derives no metric of its own -- a numpy
+# reimplementation is how the `sampler_grid` block below got two wrong answers
+# before this one -- and it changes no verdict.
+#
+# Where an `abs_tol` floor is an INVERSION of `check_array` -- the one place it
+# does arithmetic the gate does not -- the plugin ALSO finds the same floor by
+# bisecting `check_array`'s own verdict, and on this instance the two agree on
+# all 35 non-zero floors to 2.3e-07 relative (`floor_agrees: true` on every one).
+#
+# WHICH ROWS THE MODE AXIS CAN MOVE AT ALL. Four of the eleven are graded ONLY
+# through single-sequence probes -- `Engine.generate` drives one request and
+# `serve.py` scores one prompt per request, on every mode -- so core_qwen3's
+# surface and this one are the same computation. The other seven are graded on
+# the ragged forward or on artifacts derived from it, which IS a different
+# reduction: THIRTEEN query tokens over three sequences against a 32-wide masked
+# softmax (11 + 1 + 1, `query_start_loc [0, 11, 12, 13]`), where core reduces
+# eleven tokens over one, plus a WARM-UP forward of 12 more rows (4 + 8) that
+# has no analogue on `core`.
+#
+#   SINGLE-SEQUENCE, transfer is structural
+#     logprob_atol, logprob_cumulative_atol, held_out_logprob_atol,
+#     held_out_seq_atol
+#   RAGGED FORWARD, and the surface really does move
+#     abs_tol (fp32), centered_cosine_floor (fp32), argmax_margin,
+#     centered_cosine_floor (native), abs_tol.kv_cache_state,
+#     abs_tol.hidden_states, decisive_margin
+#
+# AND "STRUCTURAL" TURNS OUT NOT TO MEAN "core_qwen3's DIGITS". All four
+# single-sequence floors MOVED, by 0.7% to 6.9%, against core_qwen3's published
+# figures -- because the mode axis reaches those probes through the COMPILED
+# GEOMETRY (`max_num_seqs` 3 and `num_pages` 12 change the bucket the generate
+# and serve probes compile into) even though it does not change what they
+# reduce. The classification above says which SURFACE is graded; it is not a
+# licence to quote another instance's numbers, and ragged_qwen2 recorded the
+# same lesson independently.
+#
+# THREE PREDICTIONS THIS ROUND WAS ASKED TO TEST, AND HOW THEY CAME OUT:
+#   `abs_tol.kv_cache_state` was predicted to MOVE (the ragged cache carries the
+#     warm-up's writes). IT DID: floor 0.6266 on core_qwen3 -> 0.780859 here,
+#     1.25x, and the binding element is a slot that exists only on this mode.
+#     The declared 2.0 still clears it at 2.56x, so the key does not move.
+#   `argmax_margin` was predicted to STOP being inert, because ragged_llama3
+#     measured its reference-as-candidate flipping 2 of 14 ragged argmaxes. IT
+#     DID NOT. Zero of the 13 ragged rows, zero of the 14+11 battery rows, zero
+#     of the 8 decode steps, zero anywhere: 18 strict-logit calls, no decisive
+#     disagreement even at margin 0.0. The tightest-gate-in-the-suite property
+#     is ragged_llama3's, not `ragged`'s.
+#   `centered_cosine_floor.hidden_states` was predicted to be worth re-checking
+#     because ragged_llama3's post-final-norm layer is its SECOND tightest
+#     reading. Here it is the FOURTH, at 6.44x, and no override is declared.
+#
+# CHANGING A VALUE HERE IS NOT A ONE-FILE EDIT, which is why this round changed
+# none of them. `golden/meta.json` is what the grader reads and
+# `_grade_precheck.py`'s gate 5/9 (`check_meta_mirrors_instance_yaml`) aborts
+# the whole grade -- exit 3, no reward.json -- the moment the two disagree. A
+# new number has to move through the freezer.
+#
+# A FLOOR HERE IS A FLOOR ON CROSS-KERNEL NOISE between THIS torch reference and
+# THIS jax reference. It is not an estimate of what an independent port will
+# produce, so a ratio below is headroom over a lower bound.
+#
+# THE TIGHTEST GATE IN THIS SUITE IS `abs_tol.kv_cache_state`, AT 2.56x,
+# followed by `abs_tol.hidden_states` at 2.59x and the fp32 centred cosine at
+# 2.80x. `argmax_margin` -- the tightest gate on ragged_llama3 -- is INERT here.
+# Every tier default nothing overrides is 15.9x or wider; they are listed at the
+# end of the native block so "the band" means the whole band and not only the
+# overridden half.
+#
+# THE ONE KEY THIS INSTANCE DOES NOT DECLARE is
+# `native_thresholds.centered_cosine_floor.hidden_states`, and that is a
+# measured decision rather than an omission -- see its own block below. The key
+# set was diffed against all seven sibling instances: the union across the class
+# is six fp32 keys and six native ones; this instance declares eleven of the
+# twelve; the twelfth is declared ONLY by core_qwen2 and is waived to that one
+# instance by name in the harness's symmetry test. BOTH
+# `ragged` instances declare the IDENTICAL key set, so there is no
+# ragged-to-ragged gap to close. That gate is what stops a threshold a check
+# reads but nobody declares from silently falling back to the loosest class
+# default; chunked_llama3 shipped three such keys before it existed.
+# ===========================================================================
+
+# The fp32 exactness tier. Defaults come from `compare.FP32_EXACT_THRESHOLDS`
+# (abs 1e-3, rel 1e-3, cosine 0.999999, KL 1e-4, argmax_margin 0.0); only the
+# lines below differ.
+#
+# A WARNING INHERITED FROM core_qwen3 DOES NOT APPLY HERE, AND THE REASON IS
+# TRACED. core_qwen3 recorded "the KV surface measured 3.967e-04, 3.97x
+# over core_qwen2's calibrated 1.0e-4". Traced to its source, that figure comes
+# from the parity checks' `test_kv_cache_state_agrees_after_{prefill,generate}`
+# -- a NON-GRADED, pre-freeze diagnostic that compares the
+# FULL fp32 KV-cache tensor end to end. That is a different quantity on a
+# different fixture from `paged_attention/fp32`, which grades an ISOLATED,
+# frozen `(q, k, v)` unit. `surface="kv_cache_state"` is passed only at the
+# NATIVE tier (test_numeric.py:790-791); THERE IS NO fp32-TIER
+# `kv_cache_state` CHECK AT ALL, so there is no key here to calibrate against
+# that number. See the standalone `KV_ATOL` note at the end of the native block
+# for what this instance measured about it and what the fix should look like.
+fp32_thresholds:
+  # `check_array`'s absolute term, for every fp32 ARRAY surface: the twelve
+  # `reference_units` output arrays, `paged_attention/fp32`, the five sampler
+  # grid points and `topn_logprobs` -- 19 arrays in all, every one of them
+  # instrumented in the runs below. Class-standard value (identical on all eight
+  # shipped instances); NOT re-derived here.
+  #
+  # THE SURFACE MOVED WITH THE MODE. The producer did not; its OUTPUT did. Every
+  # array in `golden/reference_units.npz` is `prompt_len` rows on `core` and NONE
+  # of them is 11 rows here -- MEASURED, from the instrumented shapes:
+  # `lm_head.out0` is (13, 151936), the graded RAGGED batch, while the OTHER
+  # ELEVEN (the seven layer-0 unit outputs, both `rotary_emb` outputs and both
+  # `final_norm` outputs) are (12, ...), which is the WARM-UP forward -- the 4-
+  # and 8-token prefixes the two decode requests need written before the graded
+  # forward can run. So eleven of the twelve arrays this key grades on the
+  # `reference_units` surface come from a forward that exists only because the
+  # mode is `ragged`, and the twelfth is two rows wider than core's.
+  #
+  # MEASURED HERE (worst of 3, all 3 identical), floor =
+  # `max_i(|d_i| - 1e-3*|ref_i|)`, which is `check_array`'s own comparison
+  # inverted, cross-checked by bisecting the gate's verdict:
+  #     reference_units/lm_head/lm_head.out0        4.983004e-06  <- BINDS
+  #     paged_attention/fp32                        2.951980e-07
+  #     reference_units/gate_up_proj.out0           2.931540e-07
+  #     reference_units/down_proj.out0              8.019340e-08
+  #     reference_units/qkv_proj.out0               6.738680e-08
+  #     reference_units/o_proj.out0                 6.433580e-08
+  #     input_layernorm.out0, rotary_emb.out0/out1,
+  #       post_attention_layernorm.out0/out1,
+  #       final_norm.out0/out1                      0.0  (rel term alone)
+  #     sampler_grid/0..4, topn_logprobs            0.0  (rel term alone)
+  #     floor 4.983004e-06   value 1.0e-4   -> ratio 20.07x
+  #
+  # WHERE IT BINDS, AND WHY THAT EXPLAINS THE AGREEMENT WITH core_qwen3. The
+  # binding element is `lm_head.out0[4, 147127]`: |ref| 1.7425e-03, |d|
+  # 6.7255e-06, on ROW 4 of the 13 -- inside sequence 0, i.e. core_qwen3's own
+  # prompt token for token. core_qwen3 published 4.983e-06 for this key and this
+  # instance reads 4.983004e-06; that is not an inherited digit, it is the SAME
+  # ELEMENT of the same computation, and the two extra ragged rows never reach
+  # it. A 1024-deep fp32 contraction into 151 936 columns is what binds -- and
+  # core_qwen3's own block records `lm_head.out0` as the binding surface on all
+  # four families, which is that instance's claim rather than one re-taken here.
+  #
+  # WHAT THE KEY ACTUALLY GRADES: `check_array` is `|d| <= abs + rel*|ref|` with
+  # rel_tol 1e-3, and max |d| on that surface is 3.4332e-05 at |ref| up to 24.23
+  # -- where the REL term already admits 2.4e-02 and this key is not what passes
+  # it. The abs term is the dominant one only on the small-|ref| region, and the
+  # floor above is taken there.
+  abs_tol: 1.0e-4
+  # Minimum per-token CENTERED cosine on the fp32 prefill logits (the only fp32
+  # logit surface -- there is no fp32 decode-step check, `has_fp32_decode` is
+  # deselected on every instance). Not a `NumericThresholds` field; served
+  # through `Golden.fp32_extras`. Class-standard value, NOT re-derived here.
+  #
+  # QUANTISED, not ratio'd: both cosine clauses accumulate in float32 over
+  # 151 936 columns, where the spacing next to 1.0 is one quantum = 2^-24 =
+  # 5.9605e-08, so every value the metric can return is a multiple of it.
+  #
+  # MEASURED HERE (worst of 3, all 3 identical), on `fp32_prefill_logits`,
+  # shape (13, 151936), binding ROW 0:
+  #     min per-token centered cosine   0.99999982   1-c = 1.788139e-07
+  #                                                      =  3.0 quanta
+  #     value 0.9999995                 1-c = 5.0e-07     =  8.389 quanta
+  #     -> ratio 2.80x (quanta over quanta)
+  #
+  # THREE QUANTA, NOT core_qwen3's FOUR -- and the direction is the surprise
+  # worth recording. This instance reads the fp32 centred cosine LOOSER than the
+  # `core` instance it inherits from (core_qwen3: 4.0 quanta, 2.10x), so the
+  # ragged forward is not noisier here on this statistic; it is saturated on
+  # both. ragged_llama3 read 3.0 quanta too, against core_llama3's 1-2, and
+  # traced the difference to float32 rounding of the STATISTIC rather than to
+  # the reduction -- two extra rows are two extra draws from the same rounding
+  # distribution, and the sign of the move is not predictable from the mode.
+  # THE HEADROOM IS NOT SPENDABLE for the same reason: 2.80x on a quantity whose
+  # entire measured value is float32 rounding is not a physical margin that
+  # would hold on another GPU or another XLA build, so tightening toward the
+  # floor would be calibrating against the metric's own noise.
+  centered_cosine_floor: 0.9999995
+  # Per-token / cumulative absolute bounds on the chosen-token logprob of the
+  # free-running fp32 generation (`test_behavioral.test_decode_trajectory`), and
+  # the first two of the four rows the mode axis cannot move by REDUCTION:
+  # `Engine.generate` drives one request on every mode. core_qwen3's values,
+  # NOT re-derived. THE FLOORS ARE THIS INSTANCE'S (worst of 3, all 3 identical,
+  # recorded from INSIDE the graded comparison rather than from a second pass):
+  #     per-token       max |d|   4.309416e-05   vs 4.0e-4   -> 9.28x
+  #     cumulative      |sum d|   1.928331e-04   vs 1.7e-3   -> 8.82x
+  #
+  # BOTH MOVED AGAINST core_qwen3 (4.3392e-05 and 1.9756e-04), by 0.7% and 2.4%.
+  # The probe reduces the same eleven tokens on both instances, so the movement
+  # is the COMPILED GEOMETRY -- `max_num_seqs` 3 and `num_pages` 12 give XLA a
+  # different bucket to lower into -- and not the mixed batch. Small, but it is
+  # the direct falsification of "structural transfer means core's digits", and
+  # it is why these two rows are measured here rather than cited.
+  #
+  # CLAUSE 2 IS NOT IMPLIED BY CLAUSE 1, and it is measured directly rather than
+  # derived as `logprob_atol * num_decode_steps`: that form gives 4.0e-4 * 8 =
+  # 3.2e-3, and the declared 1.7e-3 sits 1.88x BELOW it, so the derived bound is
+  # unreachable once the per-token clause has passed (core_qwen2's file has the
+  # inequality chain). This checkpoint's eight per-step differences do not
+  # cancel -- sum|d| and |sum d| agree to the digits printed -- so all eight
+  # share one sign, which is what makes the cumulative clause bite at all.
+  #
+  # THE NATIVE TWIN IS ~1400x LOOSER on this checkpoint, which is why there is
+  # no native bound on this quantity.
+  logprob_atol: 4.0e-4
+  logprob_cumulative_atol: 1.7e-3
+  # L6, teacher-forced over `golden/held_out.npz` -- clauses 1 and 2 of
+  # `test_behavioral.test_held_out_logprobs`. Also single-sequence (`serve.py`
+  # scores one prompt per request on every mode); also core_qwen3's values, NOT
+  # re-derived. MEASURED HERE over all 25 prompts (worst of 3, all 3 identical):
+  #     per-token       max |d|   6.103516e-05  vs 7.5e-4   -> 12.29x
+  #     per-sequence    max |d|   3.046989e-04  vs 4.0e-3   -> 13.13x
+  # core_qwen3 measured 6.5565e-05 and 2.8956e-04, so clause 1 moved -6.9% and
+  # clause 2 +5.2% -- the largest of the four single-sequence movements, and in
+  # OPPOSITE directions, which is the shape a compiled-geometry difference has
+  # and not the shape a systematically noisier reduction would have.
+  #
+  # WHICH PROMPT BINDS IS NOT MEASURED HERE, and core_qwen3's "row 18" / "row 2"
+  # are deliberately not carried across: the instrument records the graded
+  # MAXIMUM from inside the assertion, not its argmax, so naming a row would be
+  # a claim rather than a measurement.
+  #
+  # GEOMETRY RE-MEASURED off this instance's own `golden/held_out.npz` rather
+  # than assumed from the shared `held_out_prompts.yaml`: 25 prompts,
+  # cont_lens {1: 8, 4: 5, 6: 3, 8: 8, 12: 1},
+  # prompt_lens {2: 4, 6: 3, 7: 3, 8: 3, 14: 3, 15: 3, 16: 3, 22: 3}
+  # -- identical to core_qwen3's, now measured rather than expected. Clause 2's
+  # ratio is not derived from clause 1's: at the binding prompt's cont_len the
+  # derived bound would be far looser.
+  held_out_logprob_atol: 7.5e-4
+  held_out_seq_atol: 4.0e-3
+
+# The native (bf16) serving tier. Defaults come from
+# `compare.thresholds_for_profile("bf16_native")` (abs 0.1, rel 0.1, cosine
+# 0.98, KL 0.1, argmax_margin 0.0). Every value below is core_qwen3's and every
+# floor beside it is this instance's -- see the banner above.
+native_thresholds:
+  # POSITION-LEVEL decisiveness (`compare.check_logits_strict`'s `decisive =
+  # gap > argmax_margin`). On this mode it is read on EIGHTEEN surfaces, not
+  # core_qwen3's nine: the 13-row ragged forward, the 13-row fp32 forward, the
+  # eight decode steps, the three ragged per-request slices, the two
+  # batch-composition battery variants, the two decode/prefill consistency
+  # rows and `test_batching_invariance`.
+  #
+  # MEASURED HERE (worst of 3, all 3 identical), NOT by computing a gap: the
+  # instrument re-runs `check_logits_strict` itself over a ladder of margins and
+  # takes the smallest rung at which it reports zero decisive disagreements.
+  #
+  #     floor 0.0 ON ALL EIGHTEEN. The reference-as-candidate flips ZERO
+  #     argmaxes anywhere -- not on the ragged batch, not on the battery, not on
+  #     a decode step -- so there is no disagreeing position to take a floor
+  #     from and the declared value is INERT, exactly as on core_qwen3.
+  #     value 0.1875 -- class-standard, identical on every shipped instance.
+  #
+  # THE PREDICTION THAT FAILED, recorded because it was the one this round was
+  # told to test first. ragged_llama3 measured its reference-as-candidate
+  # flipping 2 of 14 ragged argmaxes, with its floor landing at exactly 0.125 --
+  # ONE bf16 grid step below 0.1875, the tightest gate in that whole suite -- and
+  # the PROVISIONAL banner here predicted the same on the ragged qwen3 batch.
+  # IT DOES NOT HAPPEN. The axis is the CHECKPOINT, not the mode: qwen3's frozen
+  # gaps are wider and its cross-port deviations smaller, and both `qwen3`
+  # instances read this key inert while both `llama3` readings do not.
+  #
+  # WHAT IS MEASURABLE IS THE GOLDEN GAP DISTRIBUTION, and the same ladder
+  # yields it without this file ever calling `partition`. `n_decisive(m)` on the
+  # 13-row RAGGED forward:
+  #     m      0.0625 0.125 0.1875 0.25  0.375 0.5  1.0  1.5  2.0  3.0  4.0  6.0
+  #     rows   13     12    12     11    11    10   9    8    8    4    1    0
+  # So exactly ONE of the 13 rows has a gap of 0.125 and sits OUTSIDE the argmax
+  # clause at the declared 0.1875; the next gap up is 0.25 and IS graded. That
+  # is not slack a wider band bought -- it is what a bf16 near-tie costs -- and
+  # unlike on ragged_llama3 the reference does not flip that row anyway.
+  #
+  # AND ONE ROW OF THE RAGGED-ONLY BATTERY IS NEVER GRADED FOR ARGMAX AT ALL. A
+  # naive row count derived from `n_decisive` AT MARGIN 0.0 misses it, because
+  # `decisive` is `gap > margin`, so a row whose gap is exactly 0.0 is never
+  # counted. The floor plugin therefore reports `n_rows_total` /
+  # `n_decisive_at_zero` / `n_exact_ties` / `n_argmax_disagree_any`, all read off
+  # the gate at a margin below every possible gap.
+  #
+  # MEASURED, straight off `golden/battery/batch_composition/d1p2/
+  # prefill_forward.npz::logits`, which is (15, 151936) and not (14, ...):
+  #     the 15 gaps  0.5  0.0  3.5  1.125  2.5  3.75  1.5625  2.0  2.625
+  #                  1.0625  3.8125  0.5  6.875  5.9375  3.125
+  #     row 1 is an EXACT bf16 tie -- tokens 17980 and 38297 both at 9.5625
+  # So `d1p2` carries the tightest row in the entire suite, not the loosest, and
+  # because `decisive = gap > argmax_margin` that row is OUTSIDE the argmax
+  # clause at EVERY value of this key, 0.0 included. It is the only such row on
+  # this instance: across all 18 strict-logit surfaces `n_exact_ties` sums to 1.
+  #
+  # THE HOLE IS REAL AND CURRENTLY UNEXPLOITED, and both halves matter.
+  # `n_argmax_disagree_any` -- the disagreement count with the decisiveness mask
+  # removed -- is 0 on all 18 surfaces, so the honest reference picks the same
+  # token on the tie row too; nothing is being hidden today. But a candidate
+  # that flips that one row cannot be convicted by this check at any threshold,
+  # and ragged_llama3 documents the matching failure: a
+  # control mutation that changes no value at all "caught" a check by flipping a
+  # tie back. `test_batch_composition_battery`'s OTHER clauses (the centred
+  # cosine, which binds the whole native tier at 5.40x on this very surface, and
+  # the KL) are what cover that row.
+  argmax_margin: 0.1875
+  # Minimum per-token CENTERED cosine, native tier. On this mode ONE floor
+  # covers the ragged prefill logits, each ragged per-request slice, the eight
+  # decode steps, both battery variants and the two self-comparisons -- and,
+  # because this instance declares no per-surface override, each hidden state
+  # too (see the block below). Class-standard budget, NOT re-derived.
+  #
+  # MEASURED HERE (worst of 3, all 3 identical). Ratios are
+  # (1 - 0.998) / (1 - measured). THE BINDING SURFACE IS A RAGGED-ONLY ONE,
+  # which is the clearest single case in this file for measuring rather than
+  # inheriting:
+  #     batch_composition battery, both variants  0.99962944  -> 5.40x  <- BINDS
+  #     prefill_logits (13 rows, binding row 12)  0.99967605  -> 6.17x
+  #     ragged_forward_logits/request_2           0.99967605  -> 6.17x
+  #     hidden_28 (post-final-norm, row 12)       0.99968958  -> 6.44x
+  #     ragged_forward_logits/request_0           0.99969214  -> 6.50x
+  #     decode steps, worst (step 7)              0.99980110  -> 10.06x
+  # The two battery variants report the SAME 0.99962944 because they share the
+  # row that produces it -- d1p2's row 13 and d2p1's row 9 are the same sequence
+  # in two compositions -- which is the identical coincidence ragged_llama3
+  # records and is worth stating as corroboration rather than as two readings.
+  #
+  # THE MODE AXIS COSTS 1.20x ON THIS KEY, MEASURED ON BOTH SIDES.
+  # `ragged_forward_logits/request_0` is sequence 0 alone, i.e. core_qwen3's own
+  # computation, and it reads 1-c = 3.078580e-04 -- core_qwen3's published
+  # 3.0786e-04 to every digit it printed. The full 13-row ragged batch reads
+  # 3.239512e-04 and the ragged-only battery 3.705621e-04. So the surface really
+  # did move, the amount it moved is 1.20x, and the same run measures the
+  # unmoved slice beside it.
+  #
+  # THE PREFILL AND request_2 READINGS ARE THE SAME NUMBER TO THE LAST DIGIT,
+  # and that is a check rather than a duplicate: the prefill minimum is attained
+  # at row 12, and row 12 IS request 2's single decode token
+  # (`query_start_loc [0, 11, 12, 13]`). Two independently-computed statistics
+  # agreeing on the same element is what confirms the slice identity.
+  centered_cosine_floor: 0.998
+  # NO `centered_cosine_floor.hidden_states` OVERRIDE, AND THAT IS NOW A
+  # MEASUREMENT ON THIS INSTANCE rather than a carried-over one. It is the only
+  # key in the class-wide union of twelve that this instance does not declare;
+  # core_qwen2 is the only instance that does, and
+  # the harness's symmetry test waives it to that one
+  # instance BY NAME with the reason (its residual stream collapses 26x at layer
+  # 22 and the centred cosine drops to 0.9931 on a correct port, so admitting it
+  # at the tier would have loosened the LOGIT clause 3.5x for a reason that has
+  # nothing to do with logits).
+  #
+  # Qwen3-0.6B's residual stream DOES collapse late -- MEASURED HERE from the
+  # instrumented per-layer peaks: the running peak is 6528 from layer 3 through
+  # layer 27 and the post-final-norm state peaks at 80.5, an 81x drop -- but the
+  # CROSS-FRAMEWORK ERROR at that layer stays small enough in cosine terms that
+  # the collapse never crosses the TIER's own budget:
+  #     worst hidden-layer 1-c HERE          3.104210e-04  (hidden_28, row 12)
+  #     tier budget (1 - 0.998)              2.0e-03       -> 6.44x
+  #     core_qwen3's reading                 3.039e-04                  (6.58x)
+  # So the ragged forward costs 2.1% on this layer and nothing else.
+  #
+  # AND THE ARGUMENT IS STRONGER HERE THAN ON EITHER PRECEDENT. ragged_llama3
+  # flags its post-final-norm layer as the SECOND tightest reading on this key
+  # (6.9x) and "worth watching". On this instance hidden_28 is the FOURTH: the
+  # battery (5.40x), the ragged prefill (6.17x) and request_2 (6.17x) are all
+  # tighter. A per-surface override exists to stop one surface's collapse from
+  # setting the tier; here the hidden states are not even the surface that sets
+  # it, so declaring one would narrow a clause nothing on this instance needs
+  # narrowed. Re-measure on the next qwen3 rung rather than inheriting this.
+  #
+  # SEQUENCE-LEVEL decisiveness, read by
+  # `test_behavioral.test_greedy_sequence`. The generation is single-sequence
+  # on every mode. core_qwen3's value, NOT re-derived.
+  #
+  # NO FLOOR IS MEASURABLE FOR THIS KEY on a correct port, and that is the
+  # honest statement rather than "floor 0": the native free-running sequence
+  # matches the golden at all 8 generated steps (tokens 15344 374 21718 13 576
+  # 6722 315 17689), so the margin branch this key guards NEVER EXECUTES. What
+  # is measurable is the separation.
+  #
+  # MEASURED HERE, `Golden.decode_margins` read verbatim through the instrument
+  # (worst of 3, all 3 identical):
+  #     [0.5, 6.0, 3.125, 3.25, 1.125, 2.3125, 5.25, 0.625]   min 0.5
+  #     value 0.125  ->  4.0x below the smallest generation-aligned margin
+  # THE LARGEST CROSS-PORT DEVIATION at the golden's own top-2 columns, per
+  # generated step: 0.125  0.25  0.125  0.0  0.0  0.125  0.125  0.0 -- strictly
+  # smaller than that SAME step's own golden margin everywhere, so no step on
+  # this instance is excusable and the check reduces to token equality.
+  #
+  # INDEX 0 READS 0.5, WHICH IS THE POINT OF MEASURING IT THROUGH THE FIXTURE.
+  # A `[-1]` read would make this element 3.125 (the last row of the ragged
+  # batch); reading 0.5 here confirms the fixture indexes sequence 0's row,
+  # taken from the same gate the grade uses -- see the shared-harness note below
+  # for the mechanism.
+  #
+  # A SHARED-HARNESS SUBTLETY APPLIES TO THIS KEY, and the mechanism is
+  # documented below rather than omitted: it is the same row--1
+  # assumption that makes this instance's INHERITED sampler grid ungradeable
+  # (see `sampler_grid`), and it has THREE consumers on a ragged
+  # instance -- two handled by the fixture, one deliberately still open.
+  #
+  # THE TRAP. A `[-1]` read of `decode_margins` would take generated step 0's
+  # margin from `prefill_forward.npz::logits[-1]`, on the ground that
+  # "`Engine.generate` emits token 0 from the LAST PREFILL ROW". True on `core`,
+  # where the graded forward holds one request and row -1 IS sequence 0's last
+  # prompt row. FALSE here: row -1 of this ragged batch is request 2's single
+  # query token, a sequence that emits no token in `generation.npz` at all, while
+  # the generation prefills sequence 0 alone and emits its first token from THAT
+  # sequence's row 10.
+  #
+  # MEASURED ON THIS INSTANCE for the two candidate rows, with
+  # `generation.npz::tokens[0]` settling which row is meant:
+  #     `[-1]`   row 12 (sequence 2)  margin 3.125  argmax  9393  <- a `[-1]` read
+  #     starts   row 10 (sequence 0)  margin 0.5    argmax 15344  <- what is meant
+  #     generation.npz tokens[0] == 15344
+  # Row 12's argmax appears nowhere in the generated sequence -- and 9393 is
+  # " earth", i.e. the SAME row the sampler freeze picks up, which is why the
+  # two consumers are one assumption and not two coincidences.
+  #
+  # THE GRADED VALUE IS 0.5, NOT 0.625, and the difference is not an error in
+  # either number. 0.625 is what a per-instance margin diagnostic reports for
+  # sequence 0, because that tool drives `solution/ref_jax_repo`; `decode_margins`
+  # is read off goldens frozen from `environment/torch_orig`, where the value is
+  # core_qwen3's documented 0.5. The two differ by exactly ONE bf16 ULP at
+  # |logit| ~ 17.375 -- the same cross-framework noise the `sequences` block
+  # already records for this row. Predicting 0.625 here means reading the JAX
+  # diagnostic against a torch-frozen artifact.
+  #
+  # AND THE DERIVED LIST MATCHES THE DOCUMENTED ONE, which is the cheapest
+  # available corroboration: `decode_margins` reads
+  # 0.5 6.0 3.125 3.25 1.125 2.3125 5.25 0.625, element for element THE EIGHT
+  # GENERATION-ALIGNED GOLDEN MARGINS written above. A `[-1]` read would make
+  # index 0 read 3.125 and the two lists would disagree in exactly the one place
+  # the trap touches.
+  #
+  # WHY IT IS LATENT HERE AND NOT LIVE. `test_greedy_sequence` excuses a
+  # divergence at generated step i only when the golden's own margin at i is
+  # BELOW this key. 3.125 and 0.5 are both far above 0.125, so on THIS instance
+  # the wrong row made the check no stricter and no looser -- the honest 0.5 is
+  # still 4x decisive. That is a property of this prompt, not a general
+  # exemption: on ragged_llama3 the same assumption reads 4.0000 where the honest
+  # value is 0.3750, a genuine bf16 near-tie, where it would silently fail
+  # candidates that diverge for exactly the reason the margin exists to excuse.
+  #
+  # NO GOLDEN MOVES. `decode_margins` is DERIVED from `prefill_forward.npz` and
+  # `decode_step.npz`, not frozen, so it needs no re-freeze -- confirmed, the
+  # freezer's `--check` reports `unchanged` across it. The
+  # eight margins listed above are unaffected: they are read off the generation
+  # artifacts, and only index 0 is ever taken from the ragged forward.
+  #
+  # GUARDED, not just described: the harness
+  # asserts the cross-artifact invariant -- the row `decode_margins[0]` reads MUST
+  # be the row that produced `generation.npz::tokens[0]`. Those two are frozen by
+  # different freezer steps, so their agreement is a real check rather than a
+  # restatement.
+  #
+  # THE THIRD CONSUMER IS STILL OPEN: the parity checks certify a sampler row
+  # chosen the same way, so they grade a different row from the one the grade
+  # uses. Class-wide audit.
+  decisive_margin: 0.125
+  # PER-SURFACE absolute bands. `check_array`'s abs term is a fixed quantity
+  # and this tier's arrays are not on one scale -- MEASURED HERE from the
+  # instrumented `max|ref|` of each: the isolated attention output peaks at
+  # 1.390625, the KV cache at 420.0, the residual stream at 6528: a 4 694x spread.
+  # The tier default (0.1) grades the attention op and the two wide surfaces
+  # name their own.
+  #
+  #   abs_tol.kv_cache_state -- THE TIGHTEST GATE IN THIS SUITE, at 2.56x, and
+  #     the key the PROVISIONAL banner predicted would move. IT MOVED.
+  #     MEASURED HERE (worst of 3, all 3 identical), over the 5 505 024
+  #     elements of [28, 12, 8, 2, 8, 128]:
+  #       max |d|                                   1.1875   (peak |ref| 420.0)
+  #       smallest abs_tol that still admits it     0.780859  -> 2.56x
+  #       floor by bisecting check_array's verdict  0.780859  (agrees)
+  #       elements over the declared 2.0                 0
+  #     core_qwen3 measured 0.6266 (3.19x), so the mode axis costs 1.246x here.
+  #
+  #     WHERE IT BINDS, AND THE SLOT DOES NOT EXIST ON `core`. The binding
+  #     element is [layer 27, page 6, slot 0, V, head 6, dim 40]: |ref| 0.27734,
+  #     |d| 0.80859. Page 6 is sequence 2's SECOND page (`page_ids: [7, 6]`,
+  #     reversed on purpose), and slot 0 of that page is its position 8 -- the
+  #     decode query token whose KV the graded forward writes on top of the
+  #     8-token prefix the WARM-UP forward laid down on page 7. That is exactly
+  #     the mechanism the banner predicted, now located to one element rather
+  #     than argued from the mode name.
+  #
+  #     THE 2.56x IS A RATIO ON THE WHOLE ARRAY, unlike
+  #     `abs_tol.hidden_states` below: max |d| 1.1875 is itself UNDER the
+  #     declared 2.0, so nothing on this surface needs the `rel_tol` term to
+  #     pass, and 2.0 / 1.1875 = 1.68x is the raw-worst-element ratio. The abs
+  #     term is the dominant one over essentially the whole tensor.
+  #
+  #     THIS KEY IS ALREADY KNOWN NOT TO TRANSFER ACROSS FAMILIES -- core_qwen3's
+  #     0.6266 exceeds core_llama3's and core_qwen2's shared 0.5 -- and it is now
+  #     known not to transfer across MODE either. Two axes, both measured.
+  abs_tol.kv_cache_state: 2.0
+  #   abs_tol.hidden_states -- 29 layers of [13, 1024], the RAGGED forward's
+  #     rows. THE DECLARED VALUE IS NOT SET FROM THE DEEP-LAYER NEED ALONE, and
+  #     that trap is live on this instance too. `test_hidden_states` rescales
+  #     this key per layer by the reference's own magnitude at that depth
+  #     (`_shallow_abs_cap`: `min(declared, 4 * declared * running_peak /
+  #     global_peak)`), and `running_peak` is the RUNNING maximum seen so far,
+  #     not each layer's own -- so before the stream ramps up the effective band
+  #     is a small fraction of the declared one.
+  #
+  #     MEASURED HERE (worst of 3, all 3 identical). "need" is the DECLARED
+  #     value that layer requires, i.e. its floor divided by its cap scale:
+  #       layer      cap scale   floor        need      binding row
+  #       hidden_0   5.5949e-05  0.0           0.0      -- (|d| exactly 0)
+  #       hidden_1   4.1552e-03  1.757812e-03  0.4230   row 2
+  #       hidden_2   4.8062e-03  7.421875e-03  1.5442   row 0   <- BINDS
+  #       hidden_26  1.0 (decl)  1.021875      1.0219   row 12
+  #       hidden_27  1.0 (decl)  0.8421875     0.8422   row 12
+  #       hidden_24  1.0 (decl)  0.6334        0.6334   row 4
+  #       every other layer                  <= 0.62
+  #       floor 1.5442  value 4.0  -> ratio 2.59x (worst of all 29 layers)
+  #
+  #     THE BINDING LAYER DID NOT MOVE AND THE DEEP LAYERS DID, which is the
+  #     interesting half. hidden_2's floor is attained at ROW 0 -- sequence 0's
+  #     first token, inside core_qwen3's own prompt -- and its cap scale is
+  #     4 * 7.84375 / 6528, a property of the checkpoint. So this instance
+  #     reproduces core_qwen3's 1.5442 on the same element for a stated reason.
+  #     Meanwhile the DEEP layers moved with the mode: core_qwen3's largest raw
+  #     per-layer need was 0.7719 at hidden_26; here hidden_26 needs 1.0219 --
+  #     32% more -- and it binds at ROW 12, sequence 2's decode query, a row
+  #     that does not exist on `core`. Without the shallow cap the binding layer
+  #     WOULD have moved to hidden_26 and the floor would read 1.0219; the cap
+  #     is what keeps hidden_2 in charge, and a floor computed only from the
+  #     deepest layer's raw need still understates the requirement by 1.51x.
+  abs_tol.hidden_states: 4.0
+  #
+  # THE TIER DEFAULTS NOTHING HERE OVERRIDES, measured on this instance in the
+  # same three runs, so that "the band" means the whole band:
+  #     abs_tol       0.1     paged_attention/native: floor 0.0 -- the rel term
+  #                           alone admits it (max |d| 3.052e-05 at |ref| <=
+  #                           1.391), and 0.1 / 3.052e-05 = 3277x on raw max |d|
+  #     cosine_floor  0.98    worst RAW cosine 0.99963462
+  #                           (test_decode_prefill_consistency[far])    -> 54.7x
+  #     max_kl        0.1     worst token KL 6.290509e-03 (the ragged prefill,
+  #                           and request_0 to the same digits)         -> 15.9x
+  # and on the fp32 tier:
+  #     cosine_floor  0.999999  raw cosine 0.99999994 = 1.0 float32 quantum
+  #                             against a 16.78-quantum budget           -> 16.8x
+  #     max_kl        1.0e-4    worst token KL 1.109524e-06              -> 90.1x
+  #     argmax_margin 0.0       floor 0.0, 13 rows, no disagreement
+  # `rel_tol` is uncalibrated on both tiers and binding on the wide surfaces;
+  # that is a recorded class-wide limit, not an instance choice.
+  #
+  # ===========================================================================
+  # A GATE CONSTANT ENFORCING A GRADED KEY ON A SURFACE THE GRADE NEVER APPLIES
+  # IT TO -- recorded here because this is the file that owns both halves, and
+  # DELIBERATELY NOT FIXED IN THIS ROUND.
+  #
+  # The parity checks set `KV_ATOL = FP32.abs_tol`, i.e.
+  # this file's `fp32_thresholds.abs_tol`, and apply it with `KV_RTOL = 0.0`
+  # to three full-tensor fp32 KV comparisons. All three are RED on this
+  # instance, at 3.967285e-04 against 1.0e-4 -- and the same three facts were
+  # established by measurement rather than argued:
+  #   * all three surfaces (prefill cache, post-generate cache, ragged cache)
+  #     read that value TO THE LAST DIGIT, so the mixed batch adds nothing;
+  #   * the UNMODIFIED core_qwen3 tree measures the
+  #     BIT-IDENTICAL 3.967285e-04 and is equally red, pinned and unpinned;
+  #   * there is no fp32-tier `kv_cache_state` graded check at all. The only
+  #     graded KV comparison is native-tier at `abs_tol.kv_cache_state`, whose
+  #     floor is 0.780859 above -- about 5 000x looser than what this gate
+  #     demands of the same physical quantity.
+  # `abs_tol`'s own GRADED binding surface, measured above, is
+  # `reference_units/lm_head.out0`, where |ref| <= 24.23. The KV cache peaks at
+  # 419.365 in fp32, two binades higher. One constant cannot be a floor for
+  # both, and tightening `abs_tol` for the surfaces it does grade is what took
+  # the non-graded one red.
+  #
+  # DO NOT "FIX" THIS BY LOOSENING `abs_tol`. That would widen the graded fp32
+  # array band 4x for every surface that needs 20x less of it, to move a
+  # PRE-FREEZE diagnostic that is failing in the safe direction.
+  #
+  # THE VALUE IS UN-NORMALISED, AND THAT IS THE WHOLE DEFECT. The comparison
+  # that carries it is across FAMILIES: the `llama3` column measures 3.338e-05
+  # against a max|kv| of 17.31 and PASSES the same constant at 3.00x, while the
+  # `qwen3` column measures 3.967285e-04 against 419.365 and fails at 3.97x.
+  # Normalised by the array's own maximum those two floors are 1.93e-06 and
+  # 9.46e-07 -- 2.038x apart -- while the RAW floors differ by 11.9x. The class
+  # already writes down the right normaliser and then does not use it: the
+  # llama3 block derives `2 * log2(hidden_size) * 2^-23 * max|kv|` as the
+  # reduction-order bound, which gives 9.998e-04 here (measured / predicted
+  # 0.40) and 4.540e-05 there (0.74). One formula spans the family axis; one
+  # flat constant is 3.0x slack on llama3 and 3.97x tight on qwen3.
+  #
+  #   AND A SUGGESTIVE IDENTITY THAT IS NOT A DERIVATION, flagged so it is not
+  #   over-read: 3.967285e-04 is EXACTLY 13 x 2^-15, the fp32 ULP of the
+  #   [256, 512) binade max|kv| lives in. Exact divisibility is necessary but
+  #   not sufficient for the binding ELEMENT to sit in that binade, and this
+  #   round did not measure which element attains it -- the llama3 block's
+  #   analogous figure works out to 35 ULPs of a 9.75 element, not of its array
+  #   max, and that block's own reading is that the disagreement scales with the
+  #   ARRAY's magnitude rather than each element's (its worst-budget element is
+  #   |kv| = 0.109). The normalised two-column comparison above is what carries
+  #   the conclusion; the divisibility is a coincidence worth a second look.
+  #
+  #   THE ATTRIBUTION, because the numbers are easy to hang on the wrong
+  #   instance: 3.338e-05, 17.31 and the 3.00x are labelled in ragged_llama3's
+  #   own file as a core_llama3 measurement. They are a
+  #   `llama3`-FAMILY reading carried into that instance's file, not a
+  #   ragged_llama3 measurement -- and 17.31 is a fp32 parity peak, not to be
+  #   compared against ragged_llama3's native `kv_cache_state` peak of 17.125,
+  #   which is a different tier.
+  #
+  # THE SHAPE OF THE FIX, stated rather than made, because this is a class-wide
+  # constant in a file every instance carries: (1) DECOUPLE `KV_ATOL` from
+  # `FP32.abs_tol` -- they grade different surfaces two binades apart, and the
+  # coupling means a graded key cannot be tightened without reddening a
+  # non-graded diagnostic; (2) DERIVE it in the test from the torch side's own
+  # array, `C * 2 * log2(hidden_size) * 2^-23 * max|ref_kv|`, with C measured
+  # across the class (0.40 and 0.74 on the two columns that have taken it, so
+  # C = 1.0 leaves 2.5x here and 1.4x on llama3, and C = 1.5 leaves 3.8x and
+  # 2.0x); (3) do NOT introduce an fp32 `kv_cache_state` key in this file to
+  # hang it on -- there is no fp32 KV check in the GRADE, so a key here would be
+  # a threshold nothing graded reads, which is the failure the class-wide
+  # symmetry gate exists to catch.
+  #
+  # ONE CLAIM IN THE PARITY CHECKS' OWN BLOCK IS UNSUPPORTED and is corrected here
+  # rather than silently reproduced: it says ragged_llama3 "records only TWO
+  # failures, because its ragged clause passes". Nothing in ragged_llama3's file
+  # records a per-clause failure count taken on ITS tree; what it records is the
+  # core_llama3 floor of 3.338e-05 at 3.00x, i.e. a llama3-family reading that
+  # is comfortably inside the band. So "two failures" is not established, and
+  # neither is "all three pass" -- the honest statement is that the llama3
+  # column's KV floor is 12x below qwen3's and the constant only fails on one of
+  # them. The conclusion the block draws -- that the axis is the checkpoint and
+  # not the mode -- survives, and is strengthened.
+  # ===========================================================================
+
+# Sampler grid -- FIVE POINTS, core_qwen3's STRUCTURE with TWO `top_p` VALUES
+# RE-SWEPT AGAINST THIS INSTANCE'S OWN FROZEN ROW. It is tempting to call the
+# grid "BYTE-IDENTICAL TO core_qwen3's FIVE POINTS" because "the sampler is a
+# per-token transform chain with no notion of a batch, so the mode axis cannot
+# move it". THE PREMISE IS TRUE AND THE CONCLUSION IS FALSE,
+# and the gap between them is the whole finding below: the mode axis does not
+# move the sampler, but it DOES move which row the sampler is evaluated ON, and
+# a grid is only screenable against a row.
+#
+# ===========================================================================
+# WHY THE INHERITED GRID HAD TO MOVE -- MEASURED ON THE FROZEN
+# `golden/sampler.npz`, NOT PREDICTED.
+#
+# the freezer takes the sampler's input as
+# `logits[-1]` OF THE GRADED FORWARD (`self._prefill_last_logits`). On a `core`
+# instance that is sequence 0's last prompt row -- which is what core_qwen3
+# screened its five points against. ON A RAGGED BATCH IT IS THE LAST REQUEST'S
+# SINGLE DECODE TOKEN: `query_start_loc` is [0, 11, 12, 13], so row 12 is
+# sequence 2's, "In the beginning God created the heavens and the".
+#
+# THE FROZEN ROW, read straight off `golden/sampler.npz::logits`:
+#     argmax          9393 (" earth") -- sequence 2's continuation, confirming
+#                     the row identity above rather than assuming it
+#     top-1 PROB      0.895684
+#     top1-top2 gap   3.125 (logits 19.875 / 16.750)
+#     cumulative mass 0.8957 / 0.9350 / 0.9561 / 0.9777(5) / 0.9897(10)
+# That is the same property that makes sequence 2 a GOOD choice for
+# `test_batching_invariance` (see the `sequences` block: its 3.125 lone-leg
+# margin is what stops that check coin-flipping on a bf16 tie) working against
+# this one. A repair to one check degrading another, exactly as
+# `test_the_sampler_grid_makes_chain_ORDER_observable`'s own docstring warns.
+#
+# WHAT core_qwen3's FIVE POINTS DO ON THAT ROW -- keep counts and, per
+# alternate chain order, cells whose SURVIVAL differs from the canonical
+# temperature -> top_k -> top_p:
+#     grid[0] {t=1.0, k=0,  p=1.0 }  keep 151936   t->p->k 0   k->p->t 0
+#     grid[1] {t=1.0, k=0,  p=0.91}  keep      2   t->p->k 0   k->p->t 0
+#     grid[2] {t=0.7, k=50, p=1.0 }  keep     50   t->p->k 0   k->p->t 0
+#     grid[3] {t=1.0, k=50, p=0.9 }  keep      2   t->p->k 0   k->p->t 0
+#     grid[4] {t=0.7, k=0,  p=0.9 }  keep      1   t->p->k 0   k->p->t 1
+#   TOTALS  t->p->k 0 cells, k->p->t 1 cell.
+# So `test_the_sampler_grid_makes_chain_ORDER_observable` was RED the moment
+# the goldens existed ("no grid point distinguishes the canonical chain from
+# ['t->p->k']"), and grid[4] had collapsed to ONE surviving token -- a
+# one-token mask is invariant under every permutation of the three transforms,
+# so it grades nothing about order at all. NOTE WHAT WOULD STILL HAVE PASSED:
+# `test_sampler_transforms` grades the three transforms individually and would
+# not have noticed their ORDER was ungraded on this instance.
+#
+# THE MECHANISM IS MODE-GENERAL, NOT A FAMILY QUIRK. The sibling ragged_qwen2
+# measured the same collapse independently (top-1 prob 0.9736, three of six
+# points dead). And ragged_llama3's own file claims its grid is "byte-identical
+# to core_llama3's, and deliberately so" -- THAT COMMENT IS A FOSSIL: its
+# values are NOT core_llama3's, so it evidently hit this same collapse,
+# re-swept, and never updated the prose. Do not cite it as precedent for
+# inheriting a grid.
+#
+# WHAT MOVED, AND HOW LITTLE. Exactly TWO fields, both `top_p`, on the two
+# points that are supposed to carry the two order axes. Temperature, top_k and
+# the point count are all still core_qwen3's, so the family-vs-mode comparison
+# this instance exists to make is still single-variable everywhere the row
+# permits it:
+#     grid[3]  top_p 0.9  ->  0.993     (temperature 1.0, top_k 50 unchanged)
+#     grid[4]  top_p 0.9  ->  0.985     (temperature 0.7, top_k 0  unchanged)
+#
+# THE RE-SWEPT GRID, ALL FOUR SCREENING CRITERIA RE-MEASURED ON THIS ROW.
+# "mass margin" is criterion 2 -- the smaller of the two distances from `top_p`
+# to the cumulative boundaries either side of the cut, against
+# `test_no_sampler_grid_point_cuts_inside_a_tie`'s 5.0e-05 floor. "bf16" is
+# criterion 4 -- the kept and dropped logits AT the cut, after temperature and
+# top_k, round-to-nearest-even'd to bf16 and required to differ:
+#
+#   idx  t     k    p       keep   t->p->k  k->p->t  mass margin        bf16 kept/dropped
+#    0  1.0    0   1.0    151936      0        0     n/a (no top_p)     n/a
+#    1  1.0    0   0.91        2      0        0     1.4316e-02  286x   16.75   / 16.125
+#    2  0.7   50   1.0        50      0        0     n/a (no top_p)     n/a
+#    3  1.0   50   0.993      11      6        0     5.4675e-04   10.9x 13.3125 / 12.3125
+#    4  0.7    0   0.985       2      0        6     5.4077e-03  108x   23.875  / 23
+#   TOTALS  t->p->k 6 cells, k->p->t 6 cells -- NEITHER DIRECTION DEAD.
+# No point cuts inside an exact tie; no cut boundary collides at bf16; no point
+# keeps fewer than two tokens. The thinnest mass margin is grid[3]'s, 10.9x the
+# floor -- and for scale, the point that once shipped and failed the oracle by
+# one token had a margin of 5.4e-06, 100x smaller than this.
+#
+# WHY THE TWO NEW VALUES ARE THE ONES THEY ARE, since both directions had many
+# feasible candidates (227 co-active points cleared every criterion in the
+# sweep):
+#   grid[3] {t=1.0, k=50, p=0.993} carries t->p->k. top_k and top_p must be
+#     genuinely CO-ACTIVE for that order to be observable: the canonical chain
+#     cuts on probabilities RENORMALISED over the k survivors, the alternate
+#     cuts on the full row, and the two keep counts differ only where `p` lands
+#     between the two. With this row's 0.8957 top-1 mass, anything at or below
+#     p ~ 0.99 keeps so few tokens after top_k that both orders agree -- which
+#     is exactly why the inherited 0.9 read zero. Held at t=1.0 (so the point
+#     isolates the k/p interaction) and k=50 (core_qwen3's).
+#   grid[4] {t=0.7, k=0, p=0.985} carries k->p->t. Temperature and the
+#     cumulative cut do not commute: the canonical chain cuts on the SHARPENED
+#     distribution, the alternate on the raw one. Held at core_qwen3's t=0.7;
+#     only `p` moved, far enough that the sharpened cut keeps 2 rather than
+#     collapsing to 1.
+# A HIGHER-MOVEMENT GRID WAS AVAILABLE AND DELIBERATELY NOT TAKEN: points at
+# t=1.5/2.0 move 40-90 cells, but they would have moved a SECOND field on each
+# point for no gain the gate can read -- the gate's bar is "> 0 cells", the
+# graded mask clause is exact, and mass margin is what actually protects a
+# cross-framework keep count. Six cells on each axis with 10.9x and 108x of
+# margin was preferred to fifty cells with less.
+#
+# TO RE-TAKE THESE NUMBERS: they are all static functions of
+# `golden/sampler.npz` and this block, reproducible from them alone -- three
+# checks, no GPU, no container.
+# ===========================================================================
+#
+# REVERTING TO ragged_llama3's GRID WOULD SILENTLY REINTRODUCE A MEASURED BUG,
+# which is the specific reason this is called out rather than left implicit.
+# grid[1]'s `top_p: 0.91` below is NOT llama3's 0.985 nor a free choice: at
+# top_p 0.9 on THIS checkpoint, core_qwen3's cross-framework parity
+# harness found the NATIVE (bf16) tier's cumulative cut landing its boundary on
+# a pair of tokens (27602, 15948; fp32 logits 13.574535369873047 and
+# 13.565860748291016, gap 8.67e-03) that round to the IDENTICAL bf16 value
+# (13.5625) -- verified by explicit round-to-nearest-even bit manipulation on
+# the stored fp32 bits, not inferred from the gap being small. torch kept 27602
+# and dropped 15948; JAX did the reverse; both kept exactly 22 tokens, so this
+# was a tie-break disagreement, not a wrong count on either side. That
+# collision is a property of the CHECKPOINT and the PROMPT -- both of which
+# this instance holds fixed -- so it is live here too.
+#
+# THAT WAS NOT VISIBLE TO THE ORIGINAL THREE SCREENING CRITERIA: criterion 2
+# checks the CUMULATIVE PROBABILITY margin from the top_p threshold in fp32
+# arithmetic, which the point cleared by ~32x at the original p=0.9. A large
+# probability-mass margin does not imply the individual LOGIT at the cut
+# boundary is far from its neighbour in bf16-rounding terms. CRITERION 4 is the
+# predicate that does check it: no two tokens that are ADJACENT in fp32-sorted
+# rank, at a position a native-tier check can expose as a boundary or as an
+# internally-ordered pair, may round to the IDENTICAL bf16 value.
+#
+# core_qwen3's MEASURED boundary distances on ITS row, kept for contrast with
+# the table above -- these are NOT this instance's numbers and the point of
+# printing them is that they do not transfer:
+#   grid[1] {t=1.0, k=0,  p=0.91}: keep=27, margin 9.153e-04 above the boundary
+#   grid[3] {t=1.0, k=50, p=0.9}:  keep=16, margin 1.247e-03 above the boundary
+#   grid[4] {t=0.7, k=0,  p=0.9}:  keep=8,  margin 1.414e-02 above the boundary
+# Every keep count there is comfortably plural; on THIS row the same three
+# points keep 2, 2 and 1. Same checkpoint, same five points, different row.
+#
+# BOTH grid[3] AND grid[4] ARE STILL REQUIRED for chain-order observability, by
+# the same two DIFFERENT mechanisms core_qwen3 documented -- only the `top_p`
+# values changed. MEASURED HERE: grid[3] {t=1.0, k=50, p=0.993} supplies the
+# ENTIRE t->p->k discrepancy (6 cells, top_k and top_p co-active) and none of
+# k->p->t; grid[4] {t=0.7, k=0, p=0.985} supplies the ENTIRE k->p->t
+# discrepancy (6 cells, temperature and the cumulative cut not commuting) and
+# none of t->p->k. Dropping either leaves one alternate direction dead --
+# exactly `test_the_sampler_grid_makes_chain_ORDER_observable`'s failure mode,
+# which is what this instance's INHERITED grid had. Do not trim this grid, and
+# do not "restore" either `top_p` to 0.9.
+sampler_grid:
+  - {temperature: 1.0, top_k: 0,  top_p: 1.0}
+  - {temperature: 1.0, top_k: 0,  top_p: 0.91}
+  - {temperature: 0.7, top_k: 50, top_p: 1.0}
+  # RE-SWEPT, was 0.9: carries t->p->k (6 cells, keep 11, mass margin 10.9x).
+  - {temperature: 1.0, top_k: 50, top_p: 0.993}
+  # RE-SWEPT, was 0.9: carries k->p->t (6 cells, keep 2, mass margin 108x).
+  - {temperature: 0.7, top_k: 0,  top_p: 0.985}
+# HELD FIXED at core_qwen3's, and a CLASS-WIDE constant (5 on every shipped
+# instance). core_qwen3 recorded a second bf16 tie on this surface --
+# `topn_logprobs` is computed off the SAME prefill row independent of any grid
+# point, and its ranks 4 and 5 (tokens 9856 and 32961, fp32 logits 16.437449
+# and 16.347187) round to the identical bf16 value 16.375, so both frameworks
+# keep the same two tokens but disagree on the order. CONFIRMED UNGRADED TODAY
+# (`candidate.py::sampler_probe` casts to float32 before `topn_logprobs`), and
+# NOT dodged by moving N here, because any N that still includes both ranks
+# leaves the tie and any N that excludes one risks an ambiguous SET boundary
+# instead. Carried forward as a known residual, not an oversight.
+logprobs_top_n: 5
+
+# HELD FIXED at core_qwen3's. Hard wall-clock budget (seconds) for THE WHOLE
+# CANDIDATE SANDBOX -- not, despite the name, for the candidate's generate()
+# loop. Exceeding it produces NO reward (conftest's
+# `pytest_exception_interact` turns a `CandidateTimeout` into exit 4), and
+# raising it is not free: the verifier budget is 1800 s total, so a sandbox
+# budget near that lets the sandbox be SIGKILLed instead. 900 leaves ~2x.
+#
+# THE MARGIN IS THINNER ON A `ragged` INSTANCE. ragged_llama3's documented HIGH
+# in-container sample is 510.6 s against core_llama3's 485.4 s, and the worker
+# is the dominant term in both. Expect the same ~5% widening here over
+# core_qwen3's sample; 900 s remains ~1.8x a measured honest run.
+#
+# THE WHOLE GRADE IS TIMED, which bounds the sandbox from above and is the
+# number `task.toml`'s verifier headroom sentence is divided from. MEASURED
+# on one H100, reference as candidate, SIX in-container
+# grades, every one reward 1.0 / 37 passed / 0 failed / 0 skipped / 0 errored /
+# 10 deselected; each a full oracle grading run for ragged_qwen3.
+# Paired with the host's 1-minute load average at that run's START:
+#     load 11.2  ->  in-container 312.0 s   end-to-end  317 s
+#     load 19.2  ->               295.5 s               301 s
+#     load 18.3  ->               295.1 s               300 s
+#     load 13.8  ->               297.9 s              ~303 s
+#     load 32.9  ->               342.6 s               348 s
+#     load 20.0  ->               287.0 s               292 s
+#     out-of-container pytest    294.4 / 298.3 / 356.6 s  (host venv, same two
+#                                pins; not what any timeout governs)
+# THE LOAD DOES NOT ORDER THE DURATIONS, and saying so is the honest read of
+# this table. Only the extreme tracks: the load-32.9 run is the slowest by 10%
+# and the only one outside 287-312 s. Between load 11 and load 20 the durations
+# move over that 25 s window in no order at all -- a 1-minute average is a
+# coarse instrument for a 5-minute run on a shared many-core box.
+#
+# AND THE GPU WAS NOT EXCLUSIVELY OURS during the slow run, which is the confound
+# the load average hides: another process was resident on the GPU around the last
+# run. The 342.6 s figure is therefore a CONTENDED-GPU reading, not a busy-host
+# one.
+#
+# TOTAL SPREAD 1.19x; ragged_llama3 records 164-511 s (3.1x) and says plainly
+# the spread was the box's, which is true here too but worth an order of
+# magnitude less. 900 s is 2.6x the slowest measured WHOLE grade, and the
+# sandbox this key bounds is a strict subset of that.
+#
+# `grade_seconds = (287, 343)` is recorded in the generator settings that render
+# `task.toml`'s verifier note (~5x headroom over the slow end, ~6x over the
+# fast).
+#
+# `task.toml` is GENERATOR-OWNED and carries the MEASURED verifier headroom
+# (1800 s against a measured grade, with the six timings and their host loads);
+# hand-editing that generated file makes it DIVERGED, which makes the generator
+# refuse the whole run (exit 2). Both files therefore state the same measured
+# budget.
+generate_timeout_s: 900
+
+# HELD FIXED at core_qwen3's.
+compare_hidden_states: true
+
+# THE GRADED DENOMINATOR: how many checks survive collection on this instance.
+# Per-instance -- a different mode deselects a different set -- and it does NOT
+# follow from anything else in this file, so it is declared rather than
+# derived.
+#
+# MEASURED -- read off an oracle run rather than derived on paper. The point of
+# this block is that the value is measured, not predicted. The oracle grading run
+# for ragged_qwen3, on one H100 against this instance's own frozen goldens:
+#     reward 1.0   n_passed 37   n_failed 0   n_skipped 0   n_error 0
+#     spec 14 + numeric 11 + behavioral 12 = 37, perf 0
+#     45 checks defined, 8 deselected, 37 collected
+# RE-CONFIRMED: same reward, same 37,
+# and the deselection list below verified name for name off
+# `verifier/eval_summary.json` -- ten names, no `has_ragged` among them.
+#
+# The four mode-gated checks `conftest._APPLICABLE` keys on `has_ragged`, plus
+# the battery axis this mode REQUIRES
+# (`golden_manifest.REQUIRED_GOLDENS["ragged"]`), ALL COLLECTED AND PASSED --
+# verified by name in the collection roster, not inferred from the total:
+#   test_numeric.py::test_ragged_forward_logits         has_ragged
+#   test_behavioral.py::test_batching_invariance        has_ragged
+#   test_behavioral.py::test_no_cross_sequence_leakage  has_ragged
+#   test_numeric.py::test_batch_composition_battery     has_ragged and
+#                                                       has_battery_batch_composition
+# NO `has_ragged` NAME APPEARS IN `deselected`, which is the condition that
+# would mean the mode fact never reached the grader.
+#
+# THE TEN DESELECTIONS, with the gate each one failed (`deselected_kinds` from
+# the same summary). Seven are the set ragged_llama3 records; the other three
+# are NOT in that list and each is explained rather than waved at:
+#   test_chunked_prefill_logits     mode                 has_chunked
+#   test_chunking_invariance        mode                 has_chunked
+#   test_prefix_cache_invariance    mode                 has_prefix_cache (= has_chunked)
+#   test_chunk_boundary_battery     mode+no_golden_here  has_chunked and battery
+#   test_fp32_decode_step_logits    no_producer          golden/fp32_decode_step.npz
+#   test_prefill_logits_battery     no_producer          golden/battery/prompt_length/
+#   test_paging_battery             no_producer          golden/battery/paging/
+#   test_decode_speed               ungraded+no_golden_here
+#                                        `perf_graded and has_perf_golden`.
+#                                        `golden/perf.json` is frozen and baked
+#                                        into the verifier image
+#                                        (/tests/golden/perf.json, verified in the
+#                                        image), so `has_perf_golden` is True and
+#                                        `perf_graded` alone is what deselects
+#                                        this check. The reported KIND still reads
+#                                        `ungraded+no_golden_here` because
+#                                        `conftest._DESELECTION_KIND` is a STATIC
+#                                        class-wide string, not a per-instance
+#                                        derivation -- do not read this instance's
+#                                        reason off it.
+#   test_image_preprocess           optional_feature     multimodal
+#   test_smart_resize_targets       optional_feature     multimodal
+#   test_mrope_positions            optional_feature     multimodal
+#   test_image_embedding_merge      optional_feature     multimodal
+#   test_vision_tower_units         optional_feature     multimodal
+#   test_multimodal_prefill_logits  optional_feature     multimodal
+#
+# THE LAST SIX ARRIVED WITH THE core_qwen2_5_vl WORK, in two waves, and none of
+# them existed at the first grade of this instance, which saw 45 defined / 8
+# deselected / 37 collected. All six are gated on `multimodal`, which is false
+# for `qwen3`. The DEFINED total moved 45 -> 47 (two checks) and then 47 -> 51
+# (four more, at the class re-render); the deselected count moved 8 -> 10 -> 14;
+# and the COLLECTED count did not move at any point.
+#
+# THAT IS THE USEFUL PROPERTY, and it has now been demonstrated twice rather
+# than argued once: a denominator declared as "defined minus deselected" would
+# have drifted under this instance three times without anything about the
+# instance changing, and `graded_checks` is declared as the COLLECTED count
+# precisely so it does not. The second wave is the stronger demonstration --
+# the re-render moved 1809 lines of the graded suite and the collected count
+# and the reward both stayed exactly where they were.
+# 51 - 14 = 37. core_qwen3 collects 33 on the same family, so the mode axis is
+# worth exactly the four `has_ragged` checks and nothing else -- which is the
+# comparison this instance exists to make, now measured on both sides.
+#
+# READ BY the oracle grading run, which asserts `n_passed == graded_checks` beside
+# `reward == 1.0`. NOT mirrored into golden/meta.json (see
+# the freezer's not-mirrored key list): it is a fact about
+# the tests TREE, not about the frozen arrays.
+graded_checks: 37
+
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden

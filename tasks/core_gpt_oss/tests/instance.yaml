@@ -1,0 +1,359 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# core/gpt_oss -- the instance's own data. The grader hardcodes nothing
+# per-instance: the freezer mirrors every key here into
+# golden/meta.json and `tests/fixtures.py` reads it back from there.
+#
+# Every key is checked against the freezer's known instance keys, so a
+# typo is a refusal rather than a silently-defaulted value.
+
+mode: core
+model: gpt_oss
+model_name_or_path: openai/gpt-oss-20b
+
+# THE FIRST CONSUMER OF `is_moe`. `conftest._golden_facts` reads this from
+# meta and no instance had ever set it before: gpt-oss-20b routes 4 of 32
+# experts per token and 19.1B of its 20.9B parameters live in them.
+is_moe: true
+
+# --------------------------------------------------------------------------- #
+# Precision.
+# --------------------------------------------------------------------------- #
+# The serving tier, as for every instance in this class.
+precision_profile: bf16_native
+dtype: bfloat16
+
+# WHAT "fp32" MEANS FOR THIS FAMILY, AND WHY IT IS WEAKER THAN THE OTHERS'.
+#
+# For core_llama3 and core_qwen2 the fp32 tier is "both sides run identical
+# float32 weights". It cannot be that here. `openai/gpt-oss-20b` is released
+# MXFP4-quantised: 19.1B of its parameters exist only as 4-bit codes plus a
+# shared exponent per 32 values, and there is no fp32 checkpoint to run. What
+# the fp32 tier grades for this instance is **fp32 accumulation over 4-bit
+# weights** -- the dequantised values are exact at either dtype (a 16-entry
+# table times a power of two; see quant/mxfp4.py), and what fp32 buys is the
+# accumulation, the softmaxes, the router renormalisation and the residual
+# stream.
+#
+# That is still a strictly tighter gate than the bf16 tier and it still
+# separates a correct port from an incorrect one. It is NOT the same statement
+# as the other families' fp32 tier, and `tests/instance_context.md` says so
+# where a reader will meet it.
+#
+# The numbers below are MEASURED for this instance, not inherited.
+fp32_thresholds:
+  abs_tol: 1.0e-4
+  centered_cosine_floor: 0.9999995
+  logprob_atol: 4.0e-04
+  logprob_cumulative_atol: 1.7e-03
+  held_out_logprob_atol: 7.5e-04
+  held_out_seq_atol: 4.0e-03
+
+# WHAT THE bf16 TIER CAN AND CANNOT CLAIM FOR A TOP-4-OF-32 MoE.
+#
+# Every number below is wider than core_llama3's, by one to three orders of
+# magnitude, and it is not slack -- it is the width of a real effect this family
+# has and a dense model does not. MEASURED, torch-CPU reference against
+# JAX-GPU reference on the frozen 135-token prompt:
+#
+#   136 of the 3240 (layer, token) pairs SELECT A DIFFERENT SET OF EXPERTS.
+#
+# Every one of them has the 4th-vs-5th router logit gap at or below one bfloat16
+# ULP (3.9e-3 near 1.0) and several are exactly 0.0, so the two sides' top-4 are
+# both correct readings of the same tied row. 74 of the 135 tokens carry at least
+# one flip, spread evenly over all 24 layers (first flip: 3 tokens at layer 0, 7
+# at layer 7, 2 at layer 23). A flipped token then runs a genuinely different
+# expert -- a percent-level difference in that layer's MLP output, not a
+# last-mantissa-bit one -- and the residual stream carries it to the logits.
+#
+# THE FLIPS ARE THE WHOLE EFFECT, which is why this is calibration and not a
+# concealed defect. Partitioning the 135 tokens by whether they ever flipped:
+#
+#                              flipped (74)      clean (61)
+#   hidden_24 centered cosine  min 0.969471      min 0.998832
+#   logit     centered cosine  min 0.989712      min 0.999301
+#   logit     argmax disagree  3                 0
+#
+# NOT A ROUTER-ARITHMETIC PROBLEM.
+# Computing the router projection at fp32 on both sides moved the flip count only
+# 136 -> 126: the fp32 4th/5th gaps are still ~2e-3 while the bf16 HIDDEN STATE
+# feeding the router differs by more than that. The instability is upstream of
+# the router, so no reference change removes it.
+#
+# THE BAND IS THE INTRINSIC bf16 ENVELOPE, not the observed disagreement. Each
+# side was compared to a float32 run of the SAME framework, which is the honest
+# question ("how far is bf16 from the definition?") rather than the convenient
+# one. torch-fp32 and JAX-fp32 agree to centered cosine 0.999999999996, so there
+# is one definition to be far from:
+#
+#                          torch-bf16 vs fp32   JAX-bf16 vs fp32   torch vs JAX
+#   logit centered cosine       0.995558            0.989573         0.989712
+#   hidden worst c. cosine      0.985805            0.969420         0.969471
+#   kv_cache abs_tol needed        3.4318              3.0388            3.0293
+#   hidden   abs_tol needed        542.15              534.15            278.40
+#
+# ON TWO OF THE FOUR ROWS THE TORCH REFERENCE IS THE LOOSER SIDE. Its own bf16
+# run needs a WIDER cache band (3.43 vs 3.04) and a wider hidden band (542 vs
+# 534) against fp32 than the JAX port does. A tier that demanded more agreement
+# than that would be demanding more than the reference has with itself.
+#
+# WHAT IS THEREFORE STILL GRADED HERE, stated so a green result is not read as
+# more than it is. The native tier keeps: shape, dtype and device-array
+# provenance; exact KV-cache OCCUPANCY (untouched by any of this -- it is a
+# copy); argmax parity at every decisive position; softmax KL; and gross
+# direction. It no longer resolves a sub-percent value error in the residual
+# stream. THAT SURFACE IS THE fp32 TIER'S, and on this family the fp32 tier is
+# unusually strong for exactly the reason the native one is weak: at fp32 the
+# router is not ill-conditioned, no expert flips, and the two frameworks agree
+# to twelve digits.
+native_thresholds:
+  # 108 of the 135 positions stay decisive at this margin and ZERO of them
+  # disagree; the 3 that do disagree all sit at a frozen gap of 0.0625, the
+  # smallest nonzero bf16 step at this scale. Unchanged -- the measurement did
+  # not ask for more.
+  argmax_margin: 0.1875
+  decisive_margin: 0.125
+  # Driven by ONE token in each of two surfaces: hidden_24 (post-final-norm) at
+  # 0.969471 and the logits at 0.989712, against a second-worst of 0.988847 and
+  # 0.996072. Every other one of the 25 hidden layers is >= 0.9885. The floor is
+  # 0.95 rather than 0.969 because the minimum is a single-token order statistic
+  # over a 136-flip sample: which token is worst is not run-stable, so the band
+  # carries ~1.6x of the measured (1 - cosine) rather than shaving it.
+  centered_cosine_floor: 0.95
+  # Both from the "intrinsic" column above, rounded up: 3.4318 -> 4.0 and
+  # 542.15 -> 600.0, i.e. the band each side needs against its own fp32 run.
+  # 600 IS 1.4% OF THIS MODEL'S RESIDUAL PEAK, which is 41472 at layers 7-17 --
+  # gpt-oss's attention-sink outliers, two orders above core_llama3's 414. It is
+  # a large absolute number because the tensor is, and taken literally it is
+  # vacuous for the early layers (hidden_0 peaks at 75.5).
+  #
+  # IT IS NOT TAKEN LITERALLY AT THOSE LAYERS. `test_hidden_states` rescales this
+  # value by the reference's own magnitude at each depth (`_shallow_abs_cap`), so
+  # what grades hidden_0 is 1.4% of 75.5 and not of 41728 -- the same relative
+  # band, at the scale the stream is actually at. 600.0 is what the deep layers
+  # get, bit for bit, from hidden_7 onward where the running peak is the global
+  # one. MEASURED here: the smallest abs_tol that admits the worked reference
+  # elementwise is 1.95 at hidden_2, 3.86 at hidden_6 and 278.4 at hidden_23,
+  # against caps of 6.96 / 12.65 / 600 -- 3.6x, 3.3x and 2.16x.
+  #
+  # The per-layer centred-cosine clause is the other half and is scale-free; it
+  # measures 1.000000 at hidden_0. The two clauses are complementary by design
+  # and neither subsumes the other: the cosine cannot see a pure SCALE error
+  # (halving a layer leaves it at exactly 1.0) and the absolute clause cannot see
+  # a rotation. See test_numeric.test_hidden_states.
+  abs_tol.kv_cache_state: 4.0
+  abs_tol.hidden_states: 600.0
+
+seed: 42
+
+# --------------------------------------------------------------------------- #
+# Geometry. THE ONE CONSTRAINT THAT IS NOT core_llama3'S.
+# --------------------------------------------------------------------------- #
+# `sliding_window` is 128 and `layer_types` alternates, so twelve of the
+# twenty-four layers window their attention. core_llama3's geometry
+# (max_model_len 32, prompt_len 12) never reaches 128: every sliding layer
+# would behave EXACTLY like a full layer, half the model would be untested, and
+# both "window every layer" and "window no layer" would grade green.
+#
+# So prompt_len is 135 -- over the window, so the last seven prefill rows are
+# genuinely clipped -- and all eight decode steps (positions 135..142) are
+# clipped too. Measured cost of the larger probe: a torch prefill is 15.7 s at
+# T=135 against 13.6 s at T=8, because this family's forward is dominated by
+# dequantising 19.1e9 expert values, which does not depend on T. The window
+# coverage is close to free.
+#
+# RunConfig.__post_init__ requires pages_per_seq * page_size >= max_model_len
+# (6 * 32 = 192 >= 160) and num_pages >= max_num_seqs * pages_per_seq (8 >= 6).
+#
+# `pages_per_seq` IS 6 AND NOT 5, WHICH IS THE MINIMUM. It was 5, and at 5 the
+# COMPILED BUCKET and the frozen prompt's page OCCUPANCY are the same integer --
+# `ceil(135/32)` is also 5. Three Spec checks grade the bucket at that prompt
+# (`test_static_shape_bucketing`, `test_block_table_contract`,
+# `test_attention_metadata_schema`) and none of them could tell an engine that
+# sizes its block table at `len(page_ids)` from one that sizes it at
+# `pages_per_seq`: both emit 5. MEASURED -- an occupancy-sized engine passed all
+# three. The three page_size-8 instances need 2 pages of a 4-page bucket and
+# have never had the problem.
+#
+# 6 SEPARATES THEM AT NO NUMERIC COST, and that was verified by measurement.
+# `paged_attention` masks `kv_pos >= seq_lens` with `finfo(f32).min`, whose `exp`
+# is exactly 0, so the sixth page is gathered and contributes nothing. Re-frozen
+# with the freezer: THREE files move --
+# `inputs.npz::block_tables` from shape (5,) to (6,) and this scalar in
+# `meta.json` and `scenario.json` -- and every numeric artifact is byte
+# identical. No calibrated band is invalidated.
+#
+# `test_static_shape_recompilation` grades the same bucket at a SECOND prompt
+# length and so discriminates on every instance regardless; see its docstring.
+# This is the frozen-length half, and it costs one int32 per request.
+page_size: 32
+num_pages: 8
+max_num_seqs: 1
+pages_per_seq: 6
+max_model_len: 160
+
+# NON-IDENTITY EVERYWHERE, and validate_geometry refuses anything else: over a
+# page where page_ids[i] == i the slot equals the position, so a candidate that
+# ignored block_tables and indexed the cache flat would reproduce
+# kv_cache_state.npz exactly. Five ids because the run spans
+# ceil((135 + 8) / 32) = 5 pages.
+#
+# THE THREE SPARE PAGES ARE NOT FOR THE PAGING-INVARIANCE PROBE. The probe
+# never reads `page_ids` at all -- `_t2j.candidate._default_pages` and
+# `_permuted_pages` both derive their lists from `ceil(prompt_len / page_size)`
+# and `num_pages` -- and three spare pages could not hold a five-page sequence
+# anyway: the default `[0,1,2,3,4]` and the permuted `[7,6,5,4,3]` share `{3,4}`.
+# Genuine disjointness would need `num_pages >= 10`.
+#
+# num_pages stays 8, because the probe does not need disjointness to state its
+# property: the two maps are `i -> i` and `i -> 7 - i`, which agree at no
+# integer, so every logical index moves and each leg runs on its own zeroed
+# cache. See `_t2j.candidate._permuted_pages`. 8 is what
+# `RunConfig.__post_init__` requires (`num_pages >= max_num_seqs *
+# pages_per_seq`) plus headroom for the allocator probes.
+page_ids: [3, 0, 5, 1, 7]
+
+# The K sweep. FOUR legs -- three fitting points once
+# `fit_step_time` drops call 1, the minimum at which it has a degree of freedom
+# to see a bad call in. `num_decode_steps` (8) MUST be one of these four:
+# `perf_probe` samples `tokens` -- the work gate's subject -- only on that leg,
+# and the gate silently gets `None` if the coupling breaks.
+# Feasibility, this instance's own geometry: the sweep's own page assignment is
+# NOT frozen -- `perf_probe` drives the candidate's own allocator, exactly like
+# `generation_probe` (USE_FROZEN_ALLOCATION["perf"] = False) -- so the only
+# thing that has to fit is the COUNT: ceil((prompt_len 135 + 16) / page_size 32)
+# = ceil(151/32) = 5 <= pages_per_seq (6) -- one page of headroom, unlike the
+# page_size-8 instances -- and 135 + 16 = 151 <= max_model_len (160).
+# The harness enforces both, per instance.
+perf_k_values: [2, 4, 8, 16]
+
+prompt_len: 135
+num_decode_steps: 8
+
+# o200k_harmony, vocab 201088 (the tokenizer file itself declares 200019; the
+# config pads to a multiple of 64). Encoded with
+#   Tokenizer.from_file("openai/gpt-oss-20b/tokenizer.json")
+#     .encode(text, add_special_tokens=False).ids
+# and NO bos prepended, unlike core_llama3's 128000: gpt-oss's special tokens
+# are the harmony chat frame, and a bare completion prompt is what this probe
+# is. The text is a plain factual continuation, chosen so the greedy trajectory
+# is decisive enough for `test_greedy_sequence` to be a real comparison:
+#
+#   "The capital of France is Paris, and the capital of Japan is Tokyo. Rivers
+#    shape the cities built beside them: the Seine divides Paris into a left
+#    bank and a right bank, the Thames runs east through London to the sea, and
+#    the Danube passes through four national capitals on its way from the Black
+#    Forest to the Black Sea. A river is also a boundary, a trade route, and a
+#    source of drinking water, which is why so many of the oldest settlements
+#    in Europe and Asia were founded on one. Bridges, ferries and embankments
+#    followed, and then the maps and the customs houses. The list of such river
+#    cities is long, and it begins with"
+prompt_token_ids: [976, 9029, 328, 10128, 382, 12650, 11, 326, 290, 9029, 328,
+  10198, 382, 40510, 13, 54825, 9591, 290, 15636, 8113, 49662, 1373, 25, 290,
+  74722, 144028, 12650, 1511, 261, 3561, 6922, 326, 261, 1849, 6922, 11, 290,
+  131859, 13719, 23557, 1819, 9741, 316, 290, 9624, 11, 326, 290, 8156, 4502,
+  29169, 1819, 4242, 7769, 173420, 402, 1617, 2006, 591, 290, 7613, 29632, 316,
+  290, 7613, 22114, 13, 355, 20608, 382, 1217, 261, 35021, 11, 261, 10552, 9656,
+  11, 326, 261, 4256, 328, 24947, 3411, 11, 1118, 382, 4436, 813, 1991, 328,
+  290, 34331, 95652, 306, 6267, 326, 16363, 1504, 24303, 402, 1001, 13, 135580,
+  11, 37316, 566, 326, 6588, 1104, 1626, 12661, 11, 326, 1815, 290, 24267, 326,
+  290, 51987, 20327, 13, 623, 1562, 328, 2238, 20608, 15636, 382, 1701, 11, 326,
+  480, 18015, 483]
+
+# --------------------------------------------------------------------------- #
+# Probe configuration. Identical to core_llama3's except for ONE number, and the
+# rest are held fixed on purpose -- they are per-CLASS choices, not per-family
+# ones, and holding them fixed is what makes the two instances' measured bands
+# comparable.
+# --------------------------------------------------------------------------- #
+# THE ONE NUMBER: grid 2 is `top_p 0.905`, not core_llama3's 0.9, and this is the
+# same phenomenon that already made grid 4 `0.85` there ("must not be tightened
+# to 0.9"). At 0.9 the nucleus cut on THIS row lands strictly INSIDE a tie:
+#
+#   frozen logits are bf16 values, so they quantise to a 0.03125 grid at this
+#   scale, and 215 of the top 300 are duplicates of another. p = 0.9 keeps 267
+#   tokens -- 263 strictly above the boundary logit 6.65625, plus 4 OF THE 10
+#   TOKENS THAT HOLD IT.
+#
+# Which 4 is decided by `argsort`'s tie-break over equal keys, and torch's and
+# JAX's are different. That is not a tolerance question and no band can fix it:
+# the surviving SET is compared exactly and correctly so (an off-by-one in the
+# cumulative scan must fail), and a tie-break is not a cross-framework quantity
+# any more than a Philox draw is.
+#
+# 0.905 keeps 299 tokens, and the boundary group of 6 is kept WHOLE on either
+# side. Chosen by margin, not by trying values: the fp32 cumulative-sum error on
+# this row measures 2.599e-06, and 0.905 clears the crossing by 6.32e-05 below
+# and 8.59e-05 above -- 24x. The nearby alternatives are worse (0.890 clears by
+# only 5.76e-06, 2x) or move the nucleus much further (0.920 keeps 433). Grid 4
+# and grid 5 were re-checked at the same time and both already cut cleanly, with
+# a boundary group of exactly 1. THAT CHECK IS STILL CORRECT AND IS NOT WHAT
+# MOVED GRID 5 BELOW: a boundary group of 1 means the two straddling tokens are
+# fp32-DISTINCT, with no argsort tie-break involved -- criterion 4 (bf16
+# rank-adjacency) is an ORTHOGONAL, DEEPER
+# check: it asks whether those two distinct fp32 values still round to the
+# SAME bf16 bucket once temperature-scaled, which is a question a boundary-group
+# count of 1 cannot answer.
+#
+# GRID 5 AT 0.9 FAILED CRITERION 4, MEASURED, NOT BY INSPECTION: the cut sits
+# between kept token logit 11.5 and dropped token logit 11.4375 (a clean 0.0625
+# fp32 gap, criterion 2/3-clean exactly as the paragraph above found). Dividing
+# by this row's temperature (0.7) manufactures the collision downstream:
+# 11.5/0.7 = 16.428572 and 11.4375/0.7 = 16.339286 remain fp32-distinct but both
+# round-to-nearest-even to the identical bf16 value 16.375 -- a bf16-native port
+# cannot tell which one the reference kept. The collision is not a single point:
+# it persists for every top_p in roughly [0.899, 0.908], because the SAME token
+# pair sits at the cut throughout that whole range. 0.897 clears it with 24x the
+# fp32 margin floor (1.03e-3 against the 5.0e-5 floor `test_no_sampler_grid_
+# point_cuts_inside_a_tie` requires) and was verified, not assumed, to preserve
+# the property the next paragraph documents.
+#
+# GRID 5's OWN COVERAGE, measured directly rather than inherited: grid 5 is the
+# SOLE grid point where reordering the transform chain
+# to apply temperature AFTER top_p changes anything at all -- 264 cells move at
+# the original 0.9, 248 at 0.897, versus 0 at every other grid point including
+# grid 4 (whose own order-sensitivity, top_p BEFORE top_k, is unaffected by
+# this change: 37 cells, unchanged). Moving top_p to 0.897 keeps that property
+# intact; it does not merely avoid destroying it by accident.
+sampler_grid:
+  - {temperature: 1.0, top_k: 0, top_p: 1.0}
+  - {temperature: 0.7, top_k: 50, top_p: 1.0}
+  - {temperature: 1.0, top_k: 0, top_p: 0.905}  # 0.9 cuts inside a 10-way tie
+  - {temperature: 0.0, top_k: 0, top_p: 1.0}
+  - {temperature: 1.0, top_k: 50, top_p: 0.85}  # top-k AND top-p co-active
+  - {temperature: 0.7, top_k: 0, top_p: 0.897}  # temperature AND top-p co-active;
+    # 0.9 crossed a bf16 rank-adjacency collision (criterion 4) at this row's
+    # temperature scaling -- see the block comment above `sampler_grid`.
+logprobs_top_n: 5
+
+# 3600 s. The perf stage runs INSIDE the one batched sandbox worker this budget
+# bounds (`Candidate._timeout`), and with its rounds added the in-container
+# graded pytest measured 525.36 s on an otherwise-idle host. 3600 matches
+# `[verifier] timeout_sec` -- the largest this budget could ever usefully be,
+# since the container's own hard kill fires no later than that regardless --
+# which leaves the same 6.85x headroom over that reading. One JAX generation leg
+# is a prefill plus eight decode steps over a 20.9B model that dequantises its
+# experts inside every forward.
+generate_timeout_s: 3600
+
+compare_hidden_states: true
+
+# The graded denominator, observed from the oracle grading run.
+graded_checks: 33
+
+# Authoring-host paths. NOT mirrored into meta.json.
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden

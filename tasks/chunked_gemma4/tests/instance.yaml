@@ -1,0 +1,377 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# chunked/gemma4 -- the instance's own data. The grader hardcodes nothing
+# per-instance: the freezer mirrors every key here into
+# golden/meta.json and `tests/fixtures.py` reads it back from there.
+#
+# Every key is checked against the freezer's known instance keys, so a
+# typo is a refusal rather than a silently-defaulted value.
+#
+# THE EIGHTEENTH INSTANCE, and the cell that closes the declared grid. It is
+# `core_gemma4`'s FAMILY column (`config.py`, `modeling.py`, `model/loader.py`,
+# `serve.py`, `layers/*`) against `chunked_qwen2`'s MODE column (`engine.py`,
+# `attention/paged.py`, `cache/prefix_cache.py`). Everything below that is not a
+# literal restatement of one of those two parents' values carries its own reason.
+
+mode: chunked
+model: gemma4
+model_name_or_path: google/gemma-4-E2B-it
+
+# NO `is_moe` AND NO `multimodal`, for the family parent's reasons, restated
+# because an absent key is not self-explaining: gemma-4-E2B declares
+# `enable_moe_block: false` and `num_experts: null` (the 26B-A4B sibling is the
+# MoE one), and this instance is the TEXT PATH ONLY of a tri-modal checkpoint --
+# see tests/instance_context.md. Both keys are family-scoped in
+# the harness's per-family symmetry waivers.
+
+# --------------------------------------------------------------------------- #
+# Precision.
+# --------------------------------------------------------------------------- #
+# The serving tier, as for every instance in this class.
+precision_profile: bf16_native
+dtype: bfloat16
+
+# EVERY VALUE BELOW IS MEASURED ON THIS INSTANCE, by the graded suite's own
+# gates, with a pytest plugin that records
+# what `check_array`, `centered_cosine`, `check_logits_strict` and the four
+# behavioural readers actually SAW, rather than a numpy reimplementation of them.
+# One run, reference-as-candidate, both graded pins, 41 collected /
+# 10 deselected in 1164 s. 69 abs_tol rows, 59 centered-cosine rows, 23
+# logits_strict rows, 4 behavioural rows.
+#
+# Where a value coincides with the family parent's or with the class-wide one,
+# that coincidence is a RESULT of this instance's own sweep and is stated on the
+# line. `abs_tol` bands INCLUDE the tier's relative term (`rel_tol` 0.1 native,
+# 1.0e-3 fp32), so the multiples below are `effective_abs_tol / floor`, which is
+# what the gate actually admits.
+fp32_thresholds:
+  abs_tol: 1.0e-4                    # floor 1.0034e-05 (reference_units/lm_head.out0) -- 9.97x
+  centered_cosine_floor: 0.9999995   # measured 0.99999964 on fp32_prefill_logits
+  logprob_atol: 4.0e-04              # measured 2.5034e-05 -- 15.98x
+  logprob_cumulative_atol: 4.0e-04   # measured 3.5912e-05 -- 11.14x
+  held_out_logprob_atol: 7.5e-04     # measured 7.0572e-05 -- 10.63x
+  held_out_seq_atol: 1.5e-03         # measured 1.3279e-04 -- 11.30x
+
+native_thresholds:
+  # RAISED FROM 0.1875 TO 0.375, AND THE FIRST ORACLE GRADE IS WHAT FORCED IT.
+  # At 0.1875 this instance scores 0.9512: `test_prefill_logits` and
+  # `test_ragged_forward_logits` both fail on ONE row of request 0, whose
+  # top1-top2 gap is in (0.25, 0.375]. 0.375 is the smallest rung of
+  # the floor plugin's own ladder at which `check_logits_strict` reports
+  # zero decisive disagreements, so it is a MEASURED floor and not a round
+  # number -- the true floor is somewhere in (0.25, 0.375] and the instrument
+  # does not test between those two rungs.
+  #
+  # IT IS PRECISION AND NOT A PORT DEFECT, and there are three independent
+  # measurements saying so rather than an argument:
+  #   * `fp32_prefill_logits` reports `n_argmax_disagree_any: 0` over all 120
+  #     rows of the SAME forward -- the disagreement exists only at bf16;
+  #   * `chunked_prefill_logits` grades the identical 107 rows through the
+  #     candidate's own two-call `Engine.prefill` and reports `n_bad: 0` at
+  #     margin 0.0, so the flip belongs to the mixed-batch reduction order and
+  #     not to the chunk boundary;
+  #   * the parity checks compare the same mixed batch across frameworks at fp32
+  #     and the argmax is identical on every one of the 120 rows.
+  # gemma-4 also carries `final_logit_softcapping: 30.0`, applied in the head's
+  # own dtype, which squeezes the whole 262144-wide vocabulary into (-30, 30):
+  # at |logit| ~ 15 the bf16 quantum is 0.0625, so a 0.3125 gap is five ULPs and
+  # this instance's frozen forward has TWO EXACT TIES no margin can ever convict.
+  #
+  # WHAT IT COSTS, stated because it is not free: 111 of 118 decisive rows
+  # survive on `prefill_logits` and 100 of 106 on `ragged_forward_logits/
+  # request_0` -- about 6% of rows lose their argmax clause, and `decode_step_1`
+  # (gap 0.3125) loses it too. Those rows keep their cosine and KL clauses, and
+  # `test_greedy_sequence` compares the eight decode tokens exactly at every
+  # margin.
+  argmax_margin: 0.375
+  # A CEILING, not a floor: the check excuses a divergence only BELOW it, so the
+  # strongest position is the smallest value. The golden's smallest decode
+  # margin is 0.3125, so 0.125 excuses nothing -- 2.50x clear.
+  decisive_margin: 0.125
+  # THE FAMILY PARENT'S VALUE, AND THIS INSTANCE'S OWN MEASUREMENT INDEPENDENTLY
+  # NEEDS IT -- but it is the tightest logit cosine in the class and that is
+  # worth knowing. Worst over 59 rows is `batch_composition_battery[d1p2]` at
+  # 0.9928037 (1 - c = 7.196e-03), so 1 - 0.99 carries only 1.39x, against
+  # core_gpt_oss 1.6x, chunked_gpt_oss 1.72x and core_gemma4 1.87x. The binding
+  # row is the battery variant that RE-STAGES the batch so the massive-activation
+  # row dominates a 78-row cosine; the canonical `prefill_logits` measures
+  # 0.9956189 (2.28x). NOT loosened below 0.99: 0.99 is already the loosest logit
+  # floor in the class and the quantity is deterministic under both graded pins.
+  centered_cosine_floor: 0.99
+  # DOTTED KEYS, and they reach the grader through `native_extras` ->
+  # `_surface_band` rather than through `_band()`, which silently drops them.
+  # Both were confirmed ACTIVE by the floors sweep reporting them with their
+  # surface tags and their own `effective_abs_tol`.
+  #
+  # NO `centered_cosine_floor.hidden_states` OVERRIDE, and the ABSENCE is a
+  # measurement: the worst hidden surface is `hidden_35` at 0.9962128
+  # (1 - c = 3.787e-03), which carries 2.64x against the tier's own 0.99 -- 1.9x
+  # MORE headroom than the logits have. A second key would loosen the better of
+  # the two surfaces. `test_inference_instance_symmetry._WAIVERS` records it.
+  abs_tol.kv_cache_state: 0.5        # floor 0.244849 (cache_group0) -- 2.04x
+  # 2.0, the family parent's, and this instance's own floor is 1.09375 at
+  # hidden_35 (the post-final-norm row) -- 1.83x. `_shallow_abs_cap` rescales
+  # this by the reference's own running peak at each depth, so what grades
+  # hidden_0 is 0.729 and not 2.0.
+  abs_tol.hidden_states: 2.0
+  #
+  # `max_kl` IS NOT DECLARED HERE AND IS THE CLASS DEFAULT 0.1, and this
+  # instance measures the TIGHTEST headroom the class has recorded: 4.4956e-02
+  # on `chunked_prefill_logits` and `chunk_boundary_battery[interior]` -- 2.22x.
+  # THAT CONTRADICTS THE EXTRAPOLATION THE BRIEF CARRIED IN BOTH DIRECTIONS. It
+  # was reported falling 16.07x -> 5.95x -> 5.43x on the ragged VL cell and then
+  # RECOVERING to 13.18x on the chunked VL one, with the chunked axis exonerated
+  # there ("the chunked axis's own rows are not the tightest KL rows"). Here they
+  # ARE: the two tightest rows are both the 107-row interior split, and the
+  # unchunked `prefill_logits` is looser at 2.54x. So the axis's KL cost is
+  # FAMILY-dependent, and on the family with a 262144-wide vocabulary and a
+  # 30.0 logit soft-cap it is the binding one. 2.22x is a pass and is reported
+  # rather than absorbed; a class-wide `max_kl` review is the follow-up.
+
+seed: 42
+
+# --------------------------------------------------------------------------- #
+# Geometry. THE FAMILY'S PAGE GEOMETRY, THE MODE'S BATCH.
+# --------------------------------------------------------------------------- #
+# `page_size`, `pages_per_seq`, `max_model_len`, `prompt_len`, `page_ids`,
+# `num_decode_steps` and `perf_k_values` are the FAMILY parent's, unchanged and
+# for its own reasons (which are restated here only where this mode makes them
+# cost something different):
+#
+# 1. `max_model_len` IS 544 AND NOT ~160 BECAUSE OF THE SLIDING WINDOW.
+#    `sliding_window` is 512 and 28 of the 35 layers use it, so a probe that
+#    never reaches 512 tokens makes every sliding layer behave exactly like a
+#    full one. The main probe cannot afford 520 tokens (the frozen logits alone
+#    would be 545 MB at vocab 262144), so the window is crossed on the L6
+#    HELD-OUT path -- one `520 + 6` entry in tests/held_out_prompts.yaml, which
+#    `max_model_len` exists to admit. Chunking does not change that: the chunked
+#    battery re-splits the SAME 124-token prompt, so it cannot see the window
+#    either, and dropping the held-out entry would leave the window ungraded on
+#    this cell with nothing failing.
+#
+# 2. THE LAST DECODE STEP OPENS A PAGE THE PROMPT NEVER REACHED. prompt_len 124
+#    spans ceil(124/32) = 4 pages; the run reaches 132 and spans 5.
+#
+# `num_pages` AND `max_num_seqs` ARE THE MODE'S, AND `num_pages` IS FORCED
+# RATHER THAN CHOSEN. `RunConfig.__post_init__` refuses
+# `num_pages < max_num_seqs * pages_per_seq`, and this mode's batch needs three
+# request slots against the family's `pages_per_seq` of 17, so the floor is
+# 3 * 17 = 51. That is the largest pool in the class by 2.1x, and it is the
+# arithmetic product of two values neither column is free to move: the family
+# needs 17 pages per sequence to admit its 526-token held-out entry, and the
+# mode needs three concurrent requests to have a mixed-stage batch at all.
+# It is declared AT the floor -- 51, not a round 64 -- because every page costs
+# `2 * (12*256 + 3*512) * page_size` cache elements in the frozen
+# `kv_cache_state.npz` and nothing here needs a 52nd.
+page_size: 32
+num_pages: 51
+max_num_seqs: 3
+pages_per_seq: 17
+
+max_model_len: 544
+
+# NON-IDENTITY EVERYWHERE, and validate_geometry refuses anything else: over a
+# page where page_ids[i] == i the slot equals the position, so a candidate that
+# ignored block_tables and indexed the cache flat would reproduce
+# kv_cache_state.npz exactly. Five ids because sequence 0's run spans
+# ceil((124 + 8) / 32) = 5 pages. Restates sequences[0].page_ids, which
+# `validate_sequences` requires (`_slot` reads the top-level list).
+page_ids: [3, 0, 5, 1, 7]
+
+# The K sweep, the family parent's. Feasibility on this
+# geometry: ceil((124 + 16) / 32) = 5 <= 17 and 124 + 16 = 140 <= 544 --
+# the harness enforces both.
+perf_k_values: [2, 4, 8, 16]
+
+prompt_len: 124
+num_decode_steps: 8
+
+# gemma-4's own SentencePiece-derived tokenizer, vocab 262144. `<bos>` (id 2) is
+# PREPENDED BY HAND on every sequence: gemma-4's tokenizer.json carries a
+# `TemplateProcessing` post-processor whose `special_tokens` table is EMPTY, so
+# `add_special_tokens=True` adds nothing and the tokenizer will never emit a BOS
+# of its own -- while `generation_config.json` declares `bos_token_id: 2`.
+#
+# THE PROMPT IS THE FAMILY PARENT'S, BYTE FOR BYTE, and that is deliberate: it
+# is what makes this cell's numbers comparable with `core_gemma4`'s on the one
+# axis that moved. Its measured greedy trajectory there (16 steps, bf16,
+# " cities like Paris, London, Rome, and many others.", mean step log-prob
+# -0.21) is a property of the prompt and the weights, neither of which this
+# instance changes.
+#
+#   "The capital of France is Paris, and the capital of Japan is Tokyo. Rivers
+#    shape the cities built beside them: the Seine divides Paris into a left
+#    bank and a right bank, the Thames runs east through London to the sea, and
+#    the Danube passes through four national capitals on its way from the Black
+#    Forest to the Black Sea. A river is also a boundary, a trade route, and a
+#    source of drinking water, which is why so many of the oldest settlements
+#    in Europe and Asia were founded on one. Bridges, ferries and embankments
+#    followed. The list of such river cities is long, and it begins with"
+prompt_token_ids: [2, 818, 5279, 529, 7001, 563, 9079, 236764, 532, 506, 5279,
+  529, 6056, 563, 21038, 236761, 36835, 6230, 506, 9979, 5284, 28383, 1091,
+  236787, 506, 69598, 59529, 9079, 1131, 496, 2378, 4856, 532, 496, 1447, 4856,
+  236764, 506, 77634, 8784, 13512, 1343, 5860, 531, 506, 5442, 236764, 532, 506,
+  99836, 16349, 1343, 2390, 4559, 115441, 580, 1061, 1595, 699, 506, 5561, 13988,
+  531, 506, 5561, 12991, 236761, 562, 8858, 563, 992, 496, 10134, 236764, 496,
+  5754, 9116, 236764, 532, 496, 3738, 529, 15403, 1813, 236764, 837, 563, 3217,
+  834, 1551, 529, 506, 24625, 53965, 528, 3879, 532, 11560, 964, 16311, 580, 886,
+  236761, 81689, 236764, 181140, 532, 120157, 1230, 6641, 236761, 669, 1694, 529,
+  1288, 8858, 9979, 563, 1440, 236764, 532, 625, 12502, 607]
+
+# --------------------------------------------------------------------------- #
+# The chunked axis.
+# --------------------------------------------------------------------------- #
+# 17 IS DERIVED FROM THE PAGE GEOMETRY, NOT COPIED. The three page_size-8
+# chunked instances split at 5; the property that makes 5 right there is
+# `0 < split < page_size`, i.e. a chunk that ends PART WAY THROUGH THE FIRST
+# PAGE, so the continuation chunk starts at a non-zero slot offset inside a page
+# the first chunk already wrote. At page_size 32 the same property is any split
+# in (0, 32); 17 is `chunked_gpt_oss`'s value at this same page_size and is
+# roughly the midpoint, which keeps both chunks multi-token.
+#
+# IT IS ALSO WHAT THE BATTERY'S `interior` CASE READS.
+# The chunk-boundary battery takes `interior` to be this
+# instance's own split when `0 < split < page_size` and falls back to
+# `page_size // 2` otherwise. MEASURED for this geometry (page_size 32,
+# n_tokens 124, own_split 17):
+#     aligned 32   interior 17   far_interior 33   tail 123
+# four distinct positions, none dropped, each one true to the property its name
+# asserts -- `aligned` on the page boundary, `interior` mid FIRST page,
+# `far_interior` mid SECOND page, `tail` a one-token final chunk. That is the
+# check the derivation exists for: at `page_size` 32 the old hardcoded
+# 8 / 5 / 9 / 11 would ALL have landed inside the first page and frozen four
+# variants of one thing without raising.
+chunk_split_points: [17]
+
+# THE MIXED-STAGE BATCH. `request_distribution` comes out [1 decode, 0 prefill,
+# 2 chunked] -- the chunked signature, because a declared prefix share resolves
+# to `prefill_chunked` with `chunk_start = shared_prefix_len`
+# (validate_sequences says why the two shapes unify).
+#
+# THE LENDER IS r0, NOT r2, AND THAT IS A DELIBERATE CHOICE.
+# `_invariance_cross_sequence_leakage` perturbs the LAST DECODE request and
+# checks every other request's logits are unmoved; when the perturbed request is
+# also the prefix lender its borrower reads the same physical slots BY
+# CONSTRUCTION and moves with it, which `chunked_qwen2_5_vl` had to fix in the
+# harness (that cell is forced into the r2->r1 shape by its image). This cell is
+# not forced, so it takes the same r1->r0 shape the four text-only chunked
+# instances take, and the fixed harness is exercised on its ordinary path.
+sequences:
+  # r0 -- the canonical sequence. Restates the top-level prompt and page_ids,
+  # which validate_sequences requires. Graded query is tokens[17:124].
+  - {request_id: 0, stage: prefill_chunked, page_ids: [3, 0, 5, 1, 7],
+     prompt_token_ids: [2, 818, 5279, 529, 7001, 563, 9079, 236764, 532, 506, 5279,
+       529, 6056, 563, 21038, 236761, 36835, 6230, 506, 9979, 5284, 28383, 1091,
+       236787, 506, 69598, 59529, 9079, 1131, 496, 2378, 4856, 532, 496, 1447, 4856,
+       236764, 506, 77634, 8784, 13512, 1343, 5860, 531, 506, 5442, 236764, 532, 506,
+       99836, 16349, 1343, 2390, 4559, 115441, 580, 1061, 1595, 699, 506, 5561, 13988,
+       531, 506, 5561, 12991, 236761, 562, 8858, 563, 992, 496, 10134, 236764, 496,
+       5754, 9116, 236764, 532, 496, 3738, 529, 15403, 1813, 236764, 837, 563, 3217,
+       834, 1551, 529, 506, 24625, 53965, 528, 3879, 532, 11560, 964, 16311, 580, 886,
+       236761, 81689, 236764, 181140, 532, 120157, 1230, 6641, 236761, 669, 1694, 529,
+       1288, 8858, 9979, 563, 1440, 236764, 532, 625, 12502, 607]}
+  # r1 -- the prefix-cache borrower. `shared_prefix_len` MUST be a positive
+  # multiple of page_size (PrefixCache shares whole pages), so 32 is the only
+  # value below this prompt's own length. Its first 32 tokens are r0's; token 32
+  # diverges (" where" vs " and"), so PrefixCache hashes exactly one complete
+  # page and hits on exactly that page. Its remaining 12 tokens are a partial
+  # page and are not hashable, which is what keeps the hit at 32 and not 44.
+  # The declared page list is the ONE page it allocates for itself; the freezer
+  # PREPENDS r0's first page (3), so the resolved table is [3, 9].
+  #
+  #   "...the Seine divides Paris into a left bank where the booksellers keep
+  #    their green stalls open until dusk."
+  - request_id: 1
+    stage: prefill
+    shares_prefix_with: 0
+    shared_prefix_len: 32
+    page_ids: [9]
+    prompt_token_ids: [2, 818, 5279, 529, 7001, 563, 9079, 236764, 532, 506, 5279,
+      529, 6056, 563, 21038, 236761, 36835, 6230, 506, 9979, 5284, 28383, 1091,
+      236787, 506, 69598, 59529, 9079, 1131, 496, 2378, 4856, 1298, 506, 6249,
+      24917, 2514, 910, 3826, 69708, 1932, 3097, 85083, 236761]
+  # r2 -- the decode request, and the row `_graded_index` picks. 33 tokens, so
+  # its warm-up fills page 14 exactly and its single graded token is the first
+  # slot of page 13: the decode step is on a DIFFERENT physical page from the
+  # one the warm-up wrote, which is what makes the block table load-bearing for
+  # this request rather than decorative.
+  #
+  #   "The quick brown fox jumps over the lazy dog, and the sentence is famous
+  #    because it uses every single letter of the English alphabet at least
+  #    once, which makes it"
+  - {request_id: 2, stage: decode, page_ids: [14, 13],
+     prompt_token_ids: [2, 818, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799,
+       236764, 532, 506, 13315, 563, 9639, 1547, 625, 6178, 1418, 3161, 6064, 529,
+       506, 5422, 30796, 657, 3198, 3622, 236764, 837, 3590, 625]}
+
+# --------------------------------------------------------------------------- #
+# Probe configuration.
+# --------------------------------------------------------------------------- #
+# ONE POINT MOVED, AND IT WAS MOVED BY A RED GATE ON THIS CELL'S OWN FROZEN ROW.
+#
+# THE ROW IS THE ONE THING THAT CHANGES WHEN A `core` INSTANCE BECOMES A MIXED
+# ONE. The sampler grades `logits[-1]` of the GRADED forward, which on this batch
+# is r2's single decode row -- not sequence 0's, which is what the family parent
+# screened against. r2 was chosen for a LARGE argmax margin (so
+# `test_batching_invariance` cannot coin-flip on a bf16 tie), a large margin is a
+# CONCENTRATED row, and a concentrated row is one an inherited `top_p` cannot
+# subdivide. MEASURED on this cell's frozen row: top-1 probability 0.9304 against
+# sequence 0's 0.2679, so `top_p 0.95` keeps TWO tokens and `top_p 0.9` keeps
+# ONE, and `test_the_sampler_grid_makes_chain_ORDER_observable` failed with BOTH
+# isolating swaps moving ZERO cells at all six inherited points.
+#
+# GRID 4 IS NOW `{2.0, 3, 0.85}` and it carries BOTH swaps by itself:
+# k-vs-p 1 cell, t-vs-p 1 cell, measured on the frozen row at fp32 by
+# the sampler-grid screen. The mechanism is why the temperature had
+# to move so far: the two orders differ only when `top_k`'s RENORMALISATION
+# matters, i.e. when the mass outside the top-k is not negligible -- and on a row
+# whose top-2 already carry 0.9899 at T=1.0 it never is. T=2.0 flattens the row
+# enough that `c(3)` is meaningfully below 1 and the p-cut then lands in a
+# different place depending on whether it runs before or after the k-cut.
+#
+# SCREENED ON BOTH ROWS AND AT BOTH PRECISIONS, which is what rejected the first
+# candidate pair. `{1.5, 0, 0.875}` is clean on the graded row and UNSAFE on the
+# PARITY row -- 309 survivors at fp32 against 287 at bf16, cut slack 1.8 -- so it
+# would have put a mask disagreement into the parity checks' own sampler leg while
+# looking perfect on the graded one. `{2.0, 3, 0.85}` is safe on both because
+# `top_k 3` caps the flat parity row at three tokens: 2 survivors on the graded
+# row (cut margin 9.534e-02, 1907x the 5.0e-05 floor) and 3 on the parity row, no
+# bf16 tie straddling either cut at either precision.
+#
+# THE OTHER FIVE POINTS ARE THE FAMILY PARENT'S, UNCHANGED, and all five were
+# re-screened on this row rather than inherited: every one reports SAFE.
+sampler_grid:
+  - {temperature: 1.0, top_k: 0, top_p: 1.0}
+  - {temperature: 0.7, top_k: 50, top_p: 1.0}
+  - {temperature: 1.0, top_k: 0, top_p: 0.9}
+  - {temperature: 0.0, top_k: 0, top_p: 1.0}
+  - {temperature: 2.0, top_k: 3, top_p: 0.85}   # order-observable; see above
+  - {temperature: 0.7, top_k: 0, top_p: 0.9}
+logprobs_top_n: 5
+
+# The family parent's 3600, not the class's 900: one JAX generation leg is a
+# prefill plus eight decode steps over a 4.65 B model whose forward carries a
+# 2.35 B-parameter per-layer embedding table.
+generate_timeout_s: 3600
+
+compare_hidden_states: true
+
+# The graded denominator, observed from the oracle grading run.
+graded_checks: 41
+
+# Authoring-host paths. NOT mirrored into meta.json.
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden

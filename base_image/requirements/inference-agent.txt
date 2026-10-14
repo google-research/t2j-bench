@@ -1,0 +1,12 @@
+# Agent environment for the inference tasks: the inference grade env plus torch, so the
+# agent can run environment/torch_orig. Install with:
+#     pip install -r requirements/inference-grade.txt -r requirements/inference-agent.txt
+
+torch==2.10.0
+# No `transformers`: nothing in the images imports it.
+huggingface-hub==1.8.0
+# Must match the pin in inference-grade.txt (both files go to one `pip install`).
+pyyaml==6.0.3
+
+# Images for the multimodal tasks (e.g. core_qwen2_5_vl).
+pillow==11.3.0

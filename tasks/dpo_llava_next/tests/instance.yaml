@@ -1,0 +1,84 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Resolved instance config (provenance / regeneration) for dpo/llava_next.
+# Provenance record for the generated tests/ tree.
+# Paths are relative to this file's directory (the instance test/ dir).
+training_method: dpo
+model: llava_next
+
+# Determinism + sizes (snapshotted from the authoring template at generation time).
+seed: 42
+batch_size: 1
+max_eval_examples: 2
+loss_trajectory_steps: 3
+generation_max_new_tokens: 8
+compare_hidden_states: false
+
+# Hard wall-clock budget (seconds) for the repo's OWN training loop, enforced
+# by the grader's test_train_loss_trend. It is a config knob, NOT a
+# frozen artifact: golden-free, so changing it never moves a golden. It catches a port
+# that never terminates (no jit, per-step recompilation, a runaway loop) -- not
+# micro-timing. Uniform 1200s, derived from torch_orig's training time (every torch run
+# is <=~665s; ~1.8x headroom covers a JAX port's one-time XLA compile), NOT from the JAX
+# reference -- a slow reference JAX run is not the oracle and must not inflate the budget.
+train_timeout_s: 1200
+sandbox_timeout_s: 1200
+
+# Conventional layout. shared_config is pulled from
+# the authoring model registry at generation time
+# and snapshotted into golden/meta.json for provenance.
+torch_orig: ../environment/torch_orig
+jax_repo: ../solution/ref_jax_repo
+golden_dir: golden
+
+# These 7B models exceed a single 80GB GPU under full finetuning, so this task
+# migrates LoRA training (LlamaFactory's default finetuning_type): the base weights
+# are frozen (no gradients / optimizer state) and only low-rank adapters are trained,
+# which keeps both the torch reference and the JAX port on a single GPU. Adapters
+# target all linear projections (rank 8, alpha 16, scale = alpha/rank).
+#
+# gradient_checkpointing: this instance's DPO batch is uniquely long (1232-token B=2
+# sequence), so the JAX candidate's fp32 training forward+backward peaks over 80GB
+# (O(seq^2) attention alone ~25GB) and OOMs at grade time. Per-layer activation recompute
+# (nn.remat, gated on model_args.gradient_checkpointing via load_model) brings the peak back
+# under one GPU. remat is numerically EXACT (recompute in backward), so every forward /
+# gradient / trajectory golden still matches. It lives here (not just golden/meta.json, which
+# is gitignored and regenerated) so a re-freeze preserves it -- and it is INERT on the torch
+# reference side, where the freeze runs in eval mode (HF gradient checkpointing is a no-op),
+# so no frozen golden number moves.
+shared_config_overrides:
+  finetuning_type: lora
+  lora_rank: 8
+  lora_alpha: 16
+  lora_target: all
+  gradient_checkpointing: true
+  # Multimodal golden batch: a real, UNMASKED image so the frozen forward/gradient
+  # goldens exercise the vision tower (a broken vision port changes loss + grads).
+  # The image is inlined as a base64 data-URI (file-free -> resolves identically in the
+  # freeze and grade containers); the t2j harness (tests/_t2j/candidate.py)
+  # decodes the data: prefix to a PIL.Image UPSTREAM
+  # of the stock data pipeline, so no torch_orig / ref_jax_repo mm_plugin edit is needed.
+  eval_examples:
+    - _prompt:
+        - {role: user, content: "<image>Describe this input briefly."}
+      _response:
+        - {role: assistant, content: "A brief description."}
+        - {role: assistant, content: "An inaccurate, unrelated description."}
+      _images:
+        - "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAIAAABt+uBvAAAFFklEQVR42u2azW7bRhRGj0M6dvxPWZYoOUzkAAzATZ/Diz5DHqSb9k2K5AWy6db7LIquCoHoIqM4icSx9ZPI9tSuY7ubImiL9jb0cNGh51sZgj9IOCJn7hxqYTj8dp1smTQguSG6IDjDfEBPUEfkBf0R+QhVoDVmQjAjOiW5IL0mu0e2RLpGEhFtE7QxMbqD6pDH9Fvk26gt9CpmiWCB6IrknPSEbEY2JtUkBdGIYIQp0EeoKflH+mfkl6gbdIh5QLBO1CBpksZkMVmXNCaJiXYIGpgN9ApqkRz6l+QGNUdPMccEBVFBMiQtyAqyMemU5IToV4JPmAX0ImqVfJN+g7yFitEdTIcgJmqTNEkjshCdQQoJRBCAAQ0KcuhDDgo0GAggggRSyOBOFEPeejpSMWTg6UjFkNeejlQMGXg6UjHk0NORiiGFpyMVQ2aejlQMOfd0pGIoN79OvueL0vzT3xOYwKvDty9rgDVkWW5aZLkOF11IJDctEtXhlgyJxebYAlBchwUr5JHYtAH0qA7LeUhPbP5kAahXh80u5InctMiTOowCIT25aXMF1WFQCknkpkWSOoyRIW25aZF2HYbskC25aZGteijXZblpM0nXQ7neyE2L3NRDuRq52bw9IFMP5TqVmxaZ1kO5juSmRUb1UK6HctMih/VQrgO5Obk9oEE9lOtruWkB6HU9lOtAbr6yuILSWijXd1Lzh42XI5IRUUGgMRP0DHVKfkH/mvweagm9hokItonaJDFph6xDFpO23tVDuWr/MENWrh89HVm5/ubpyMr1nqcjK9dVT0dWrtuejqxcO56OrFwfezqyct3zdGTlunf7t3z6YhPmMAdmMIOcHvRg/wtOIn8UPz8kgt4y+8v/9K+foIDi34vCO+4/+9FOufZsvpA5///0LJXrrs3l6gKgXUvl2rK5mV1Iy1K5btgsdS5kw1K5LtpsBC5k0VK5Xtlskz0HAF1ZKtdTmyHCBUCnlsp1bDNi7TsAaGypXIc2A6gLGVoq1zc247kLeWOpXJXN4cWFKEvlqmyOdk4AslSuA5uDrwsZWCrXoYUWaDmxSFsq1+PbS5Nfjr9ZIlsji0i3SdpEMUEH00HHqBb5Nv0t8lXUEnoBc0VwTnRCMiMdk2mygvTzg8kjzBT9EXVGfkn/hjxEPUCvYxoETaKYJCbtksVkMekOSYNog2AFs4gGdUlu6M/Jp6hjdIEpCIa2yvXEK1dZuX7ydGTlGno6snJd93Rk5brjwGctXhwUHPz8X+oQdv+2gcEQDv7y2rPnJZVr14lv8qCyXb9bVrn2nLhBKnT4ZZXrnhPLR3XZK6tc95xYXCsEVFa5PnZi66kuj8sq164LG/OkOkDdssq16cLYUiGgZlnluubEUFdd1soq18CJkbe6BGWV66UTB4LqcllWuc6dOC5Vl3lZ5XrkxGFytzJAR2WV63sXjtob1QF6X1a5DlwQEV9V6PDLKlflgqapEJAqq1yVExKrQkBllesbJxRfhU+iyyrXkRMCdFgZoFFZ5TpxQg9XB2hS9leuZ3dMuZ6VVa7Xd0y5XpdVrvfvmHK9X1a5bt4x5bpZVrm275hybZdVrg8dUK7xd8+bqJg8pt8lj1ExegfTINggWiFZJIXsksyQzkmmRMcEBaZAD1EFeUF/TD5FXTwsq1x7/hGzrFyfeDqycu15OrJyfeTpyMq14+nIyrXh6cjKdcXTkZXrgqcjK9dzT0dWrh88Han4O75afbQMmOTwAAAAAElFTkSuQmCC"
+      _videos: null
+      _audios: null
+      _system: ""
+      _tools: ""

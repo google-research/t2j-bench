@@ -1,0 +1,36 @@
+# Grade environment for the training tasks (torch-free). Runs the `_t2j/` grader and the
+# candidate jax_repo (flax.linen + optax).
+# `jax[cuda12]` ships its own CUDA wheels, so no CUDA toolkit is needed in the image.
+
+jax[cuda12]==0.6.2
+numpy==2.2.6
+# Pinned explicitly: the grader bitcasts bf16 through it.
+ml_dtypes==0.5.4
+pytest==9.1.0
+
+# Candidate model deps.
+flax==0.10.7
+optax==0.2.7
+
+# The candidate reads the HF .safetensors checkpoint itself; the flax backend handles bf16.
+safetensors==0.7.0
+
+# Rust tokenizer for tokenizer.json; same pin as authoring.txt so both sides encode alike.
+tokenizers==0.22.2
+
+# Lazy imports in the reference repos (pins match authoring.txt):
+#   pillow     multimodal collators and image processors
+#   omegaconf  config loading
+#   requests   ppo_* trainers calling the local reward endpoint
+#   soundfile  Qwen2.5-Omni audio
+# `av` (video) is left out on purpose: authoring.txt doesn't have it either.
+pillow==11.3.0
+omegaconf==2.3.0
+requests
+soundfile==0.14.0
+
+# NVML bindings for device/provenance checks and memory measurement helpers.
+nvidia-ml-py==13.580.82
+
+# InternVL's chat template is rendered with Jinja2, so a faithful port imports it.
+jinja2==3.1.6
