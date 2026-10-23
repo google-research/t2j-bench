@@ -24,7 +24,7 @@ tokenizers==0.22.2
 #   requests   ppo_* trainers calling the local reward endpoint
 #   soundfile  Qwen2.5-Omni audio
 # `av` (video) is left out on purpose: authoring.txt doesn't have it either.
-pillow==11.3.0
+pillow==13.0.0
 omegaconf==2.3.0
 requests
 soundfile==0.14.0
