@@ -56,7 +56,7 @@ environment, set them there too.
 ### Compute and time budget
 
 You work in a container with one visible H100 GPU, 24 CPU cores and 200 GiB of RAM, and
-have up to **2 hours** of wall-clock time to produce `jax_repo/` -- enough to write, run
+have up to **3 hours** of wall-clock time to produce `jax_repo/` -- enough to write, run
 and debug the port. That budget is for building the port; the grading afterwards runs in
 a separate offline container against artifacts frozen from a run of `torch_orig` (see
 **How you are graded**).

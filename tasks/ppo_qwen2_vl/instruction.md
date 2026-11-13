@@ -46,7 +46,7 @@ copy, and your `model.loader.convert_checkpoint` reads it straight from there.
 
 ### Compute and time budget
 You work in a container with one visible H100 GPU, 24 CPU cores and
-200 GiB of RAM, and have up to **2 hours** of wall-clock time to produce `jax_repo/` —
+200 GiB of RAM, and have up to **3 hours** of wall-clock time to produce `jax_repo/` —
 enough to write, run and debug the port. That budget is for building the port; the
 end-to-end training the grader runs afterwards is separate and much shorter (see **How
 you are graded**).
