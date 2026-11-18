@@ -18,7 +18,7 @@ pandas>=2.2.3
 omegaconf==2.3.0
 peft==0.18.1
 # Multimodal collators and image processors.
-pillow==11.3.0
+pillow==13.0.0
 # transformers 5.x image processors need torchvision; 0.25.0 matches torch 2.10.0.
 torchvision==0.25.0
 # Qwen2.5-Omni audio: soundfile decodes WAVs, soxr resamples them to 16 kHz at build time.
