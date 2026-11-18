@@ -353,6 +353,12 @@ def load_tokenizer(model_args) -> TokenizerModule:
 # ``v_head`` is not in the checkpoint -- the trainer creates it zero-initialised and trains
 # it in full -- so it is absent here too.
 _TARGET_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+#: The thinker audio tower's remaining ``nn.Linear`` layers. torch's ``all-linear`` covers
+#: the whole tower (its ``q/k/v_proj`` already match ``_TARGET_NAMES``), and the audio tower
+#: runs -- and its adapters train -- on the voicebench PPO batches, so these get adapters too
+#: (``transformers_impl``'s audio modules route them through ``_proj``).
+_AUDIO_TARGET_NAMES = ("out_proj", "fc1", "fc2", "proj")
+_AUDIO_SCOPE = "audio_tower"
 
 #: Mirror of torch's ``_lora_exclude_pattern`` marker list. ``freeze_vision_tower`` and
 #: ``freeze_multi_modal_projector`` both default True, so those subtrees get no adapter.
@@ -394,17 +400,19 @@ def is_adapter_path(path, extra=()) -> bool:
     return any(e in ps for e in extra)
 
 
-def add_adapters(params, rank: int, dtype, key=None, exclude=(), restrict=None):
+def add_adapters(params, rank: int, dtype, key=None, exclude=(), restrict=None, names=None):
     """Insert ``<name>_lora_A`` / ``<name>_lora_B`` beside every targeted ``<name>/kernel``.
 
     Sibling leaves rather than a wrapper module, so the base kernels keep their converted
     paths and ``transformers_impl``'s ``_proj`` can pick the pair up by name in-forward.
     ``A`` gets PEFT's ``kaiming_uniform_(a=√5)`` (see ``lora_a_init``) and ``B`` is zeros,
-    so the adapter is a no-op at step 0 exactly as in torch.
+    so the adapter is a no-op at step 0 exactly as in torch. ``names`` overrides the
+    targeted module names (default ``_TARGET_NAMES``).
     """
     if key is None:
         key = jax.random.PRNGKey(0)
     rank = int(rank)
+    target_names = _TARGET_NAMES if names is None else tuple(names)
 
     def walk(node, prefix, k):
         if not isinstance(node, dict):
@@ -417,7 +425,7 @@ def add_adapters(params, rank: int, dtype, key=None, exclude=(), restrict=None):
             path = f"{prefix}/{name}"
             if any(marker in path for marker in exclude):
                 continue
-            if (name in _TARGET_NAMES and isinstance(child, dict) and "kernel" in child
+            if (name in target_names and isinstance(child, dict) and "kernel" in child
                     and (restrict is None or restrict in prefix)):
                 in_d, out_d = child["kernel"].shape
                 k, ka = jax.random.split(k)
@@ -517,6 +525,11 @@ def load_model(
         config = _dc.replace(config, lora_rank=rank, lora_alpha=alpha)
         params = add_adapters(params, rank, config.dtype,
                               exclude=lora_exclude_markers(finetuning_args))
+        # The rest of the audio tower's linears (a separate key, so the decoder adapters
+        # above are drawn exactly as before).
+        params = add_adapters(params, rank, config.dtype, key=jax.random.PRNGKey(1),
+                              exclude=lora_exclude_markers(finetuning_args),
+                              restrict=_AUDIO_SCOPE, names=_AUDIO_TARGET_NAMES)
         frozen = ["<base>"]  # everything except *_lora_A/_lora_B is frozen
     module = Qwen2_5OmniForConditionalGeneration(config)
     # Stash params so ``module.generate`` can run without re-threading them.

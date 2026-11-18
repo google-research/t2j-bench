@@ -117,6 +117,17 @@ def _torch_randperm(n, gen):
     return data
 
 
+def _torch_epoch_order(n, gen):
+    """One epoch of torch ``RandomSampler(generator=gen)`` over ``n`` items: ``randperm(n)`` gives
+    the order, then torch draws one more ``randperm(n)`` (its ``[:num_samples % n]`` remainder
+    slice, empty here) when the sampler is exhausted at the end of the epoch. That trailing draw
+    advances the generator, so skipping it would reproduce epoch 1 but not epochs 2+ (verified
+    against torch's own DataLoader for 3 epochs)."""
+    order = _torch_randperm(n, gen)
+    _torch_randperm(n, gen)
+    return order
+
+
 def _decay_mask(params):
     """optax label tree: ``True`` for params that receive weight decay (exclude bias /
     LayerNorm scale+bias), matching torch's ``no_decay`` name filter."""
@@ -182,7 +193,7 @@ class Trainer:
         if self._train_perm_gen is None:
             seed = int(getattr(self.args, "seed", 42) or 42)
             self._train_perm_gen = _TorchMT19937(seed)
-        order = _torch_randperm(len(self.train_dataset), self._train_perm_gen)
+        order = _torch_epoch_order(len(self.train_dataset), self._train_perm_gen)
         return self._iter_batches(
             self.train_dataset, getattr(self.args, "per_device_train_batch_size", 1), order=order)
 

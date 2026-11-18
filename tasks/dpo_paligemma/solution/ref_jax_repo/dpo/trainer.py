@@ -50,6 +50,79 @@ import optax
 logger = logging.getLogger(__name__)
 
 
+
+
+# --- torch RandomSampler parity ------------------------------------------------
+# torch_orig's ``get_train_dataloader`` wraps the train split in
+# ``RandomSampler(generator=torch.Generator().manual_seed(seed))``.  Re-iterating that
+# DataLoader once per epoch draws a fresh ``torch.randperm(n)`` from the SAME persistent
+# generator, so the three epochs see three DISTINCT shuffles -- the frozen goldens were
+# produced under exactly that order.  A sequential JAX loop trains on a systematically
+# different trajectory (a real fidelity gap on the held-out eval loss, even though the
+# 540-step train-loss average is order-robust).  torch is not importable in the grade
+# sandbox, so this is a pure-Python bit-exact replica of CPU MT19937 + ``randperm``
+# (verified identical to ``torch.randperm`` for these split sizes).
+class _TorchMT19937:
+    N = 624; M = 397; MATRIX_A = 0x9908b0df; UMASK = 0x80000000; LMASK = 0x7fffffff
+
+    def __init__(self, seed):
+        self.st = [0] * self.N
+        self.st[0] = seed & 0xffffffff
+        for i in range(1, self.N):
+            p = self.st[i - 1]
+            self.st[i] = (1812433253 * (p ^ (p >> 30)) + i) & 0xffffffff
+        self.left = 1
+        self.next = 0
+
+    def _twist(self, u, v):
+        mix = (u & self.UMASK) | (v & self.LMASK)
+        return ((mix >> 1) ^ (self.MATRIX_A if (v & 1) else 0)) & 0xffffffff
+
+    def _next_state(self):
+        st = self.st
+        self.left = self.N
+        self.next = 0
+        for i in range(0, self.N - self.M):
+            st[i] = (st[i + self.M] ^ self._twist(st[i], st[i + 1])) & 0xffffffff
+        for i in range(self.N - self.M, self.N - 1):
+            st[i] = (st[i + self.M - self.N] ^ self._twist(st[i], st[i + 1])) & 0xffffffff
+        st[self.N - 1] = (st[self.M - 1] ^ self._twist(st[self.N - 1], st[0])) & 0xffffffff
+
+    def random_uint32(self):
+        self.left -= 1
+        if self.left <= 0:
+            self._next_state()
+        y = self.st[self.next]
+        self.next += 1
+        y ^= (y >> 11)
+        y ^= (y << 7) & 0x9d2c5680
+        y &= 0xffffffff
+        y ^= (y << 15) & 0xefc60000
+        y &= 0xffffffff
+        y ^= (y >> 18)
+        return y & 0xffffffff
+
+
+def _torch_randperm(n, gen):
+    """Bit-exact ``torch.randperm(n, generator=gen)`` on CPU (forward Fisher-Yates)."""
+    data = list(range(n))
+    for i in range(n - 1):
+        z = gen.random_uint32() % (n - i)
+        data[i], data[i + z] = data[i + z], data[i]
+    return data
+
+
+
+def _torch_epoch_order(n, gen):
+    """One epoch of torch ``RandomSampler(generator=gen)`` over ``n`` items: ``randperm(n)`` gives
+    the order, then torch draws one more ``randperm(n)`` (its ``[:num_samples % n]`` remainder
+    slice, empty here) when the sampler is exhausted at the end of the epoch. That trailing draw
+    advances the generator, so skipping it would reproduce epoch 1 but not epochs 2+ (verified
+    against torch's own DataLoader for 3 epochs)."""
+    order = _torch_randperm(n, gen)
+    _torch_randperm(n, gen)
+    return order
+
 def _decay_mask(params):
     """optax label tree: ``True`` for params that receive weight decay (exclude bias /
     LayerNorm scale+bias), matching torch's ``no_decay`` name filter."""
@@ -203,6 +276,12 @@ class DPOTrainer:
         logits (mirror of torch ``concatenated_forward``; takes ``params``)."""
         labels = batch["labels"]
         model_inputs = {k: v for k, v in batch.items() if k != "labels"}
+        # torch hands pixel_values to the model on every pass. The modeling's eager image guard
+        # cannot run under jit (the policy step and the reference-logprob precompute are
+        # jitted), where it would silently fall back to text-only; ``run_vision`` is a static
+        # Python bool (key presence is fixed per trace) that forces the SigLIP tower on.
+        if model_inputs.get("pixel_values") is not None:
+            model_inputs["run_vision"] = True
         all_logits = self.module.apply({"params": params}, **model_inputs).logits
         all_logps, valid_length = get_batch_logps(all_logits, labels, self.ignore_index)
         if self.loss_type in ("orpo", "simpo"):
@@ -490,9 +569,17 @@ class DPOTrainer:
         # can be compared step for step (and so a long run shows progress).
         _log_every = int(getattr(self.args, "logging_steps", 0) or 0)
         _t0 = _time.time()
+        # torch trains through ``RandomSampler(generator=Generator().manual_seed(seed))``: a fresh
+        # shuffle per epoch from one persistent generator. With batch size 1 every batch is one
+        # preference pair, so visiting the batches (and their cached reference log-probs) in
+        # torch's per-epoch order reproduces torch's training order exactly.
+        _perm_gen = _TorchMT19937(int(getattr(self.args, "seed", 42) or 42))
+        _shuffle = int(getattr(self.args, "per_device_train_batch_size", 1) or 1) == 1
         for epoch in range(num_epochs):
             self.epoch = epoch
-            for bi, batch in enumerate(batches):
+            _order = _torch_epoch_order(len(batches), _perm_gen) if _shuffle else range(len(batches))
+            for bi in _order:
+                batch = batches[bi]
                 ref_c, ref_r = ref_cache[bi]
                 state, opt_state, loss, aux = _train_step(
                     state, opt_state, batch, ref_c, ref_r, base_params)

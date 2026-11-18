@@ -22,8 +22,15 @@ values -> KL -> GAE -> clipped PPO update loop, with JAX adjustments:
 - the reference log-probs (the KL baseline) are the base policy under
   ``jax.lax.stop_gradient`` (torch runs ``self.model.pretrained_model`` with the
   adapter disabled).
-- generation rollout is an explicit ``jax.random`` sampling loop (temperature / top-k /
-  top-p) rather than ``model.generate``.
+- generation rollout is an explicit decode loop rather than ``model.generate``. It is
+  greedy, like torch's: torch_orig hands ``do_sample``/``temperature``/``top_p``/``top_k``
+  to ``model.generate``, but that reaches the vendored thinker ``generate`` -- a cache-free
+  greedy (argmax) decode that ignores them.
+- multimodal inputs (voicebench: ``input_features`` / ``feature_attention_mask``) reach the
+  same forwards as in torch -- the rollout's prefill step, the old-policy/value and
+  reference passes, every PPO minibatch update and the evaluation rollout -- gated by
+  ``_mm_inputs_present_in`` exactly as torch gates them. The audio tower runs as its own
+  jitted function (``_encode_audio``) and its output is scattered by the jitted LM forward.
 - weight-decay excludes bias/LayerNorm params via an ``optax.masked`` label tree.
 
 Like the torch original, the default reward is a **label reward** -- token-F1 of the
@@ -80,6 +87,27 @@ IGNORE_INDEX = -100
 # buffer -- only the (masked-out) pad columns differ.
 _SEQ_BUCKET = 64
 
+# The multimodal batch keys torch's trainer forwards (``_generate_responses`` / ``ppo_train``
+# / ``evaluate``), and the placeholder token gating each group (torch
+# ``_mm_inputs_present_in``: a group is dropped when its token is absent from the ids).
+_MM_KEYS = (
+    "pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw",
+    "image_sizes", "second_per_grid_ts", "token_type_ids",
+    "input_features", "feature_attention_mask",
+)
+_MM_GROUPS = (
+    ("image_token_id", ("pixel_values", "image_grid_thw", "image_sizes")),
+    ("video_token_id", ("pixel_values_videos", "video_grid_thw", "second_per_grid_ts")),
+    ("audio_token_id", ("input_features", "feature_attention_mask")),
+)
+
+# The collator pads every clip's mel features to the extractor's full width (30000 frames),
+# while the audio tower is chunk-local (``n_window*2`` frames per chunk, block-diagonal
+# attention; frames past a clip's length are masked). ``_encode_audio`` therefore trims the
+# all-padding tail before the tower -- exact for every real token -- rounding the kept width
+# up to this many chunks so the jitted tower compiles for only a handful of widths.
+_AUDIO_BUCKET_CHUNKS = 4
+
 
 class AverageMeter:
     """Computes and stores the average and current value."""
@@ -98,6 +126,64 @@ class AverageMeter:
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count if self.count > 0 else 0.0
+
+
+# --- torch DataLoader order parity ------------------------------------------- #
+# torch_orig shuffles the train split with ``DataLoader(shuffle=True,
+# generator=torch.Generator().manual_seed(seed), drop_last=True)``. Each ``iter(dataloader)``
+# (one per epoch) first draws the iterator's int64 base seed from that generator (two
+# 32-bit outputs), then ``RandomSampler`` yields ``torch.randperm(n)`` and -- once exhausted
+# -- computes one more ``randperm(n)`` for its (empty) ``num_samples % n`` tail. torch is
+# not importable here, so this is a pure-Python bit-exact replica of CPU MT19937 +
+# ``randperm`` (checked against torch's DataLoader for 1-3 epochs and n in {13, 16, 100}).
+class _TorchMT19937:
+    N = 624; M = 397; MATRIX_A = 0x9908b0df; UMASK = 0x80000000; LMASK = 0x7fffffff
+
+    def __init__(self, seed):
+        self.st = [0] * self.N
+        self.st[0] = seed & 0xffffffff
+        for i in range(1, self.N):
+            p = self.st[i - 1]
+            self.st[i] = (1812433253 * (p ^ (p >> 30)) + i) & 0xffffffff
+        self.left = 1
+        self.next = 0
+
+    def _twist(self, u, v):
+        mix = (u & self.UMASK) | (v & self.LMASK)
+        return ((mix >> 1) ^ (self.MATRIX_A if (v & 1) else 0)) & 0xffffffff
+
+    def _next_state(self):
+        st = self.st
+        self.left = self.N
+        self.next = 0
+        for i in range(0, self.N - self.M):
+            st[i] = (st[i + self.M] ^ self._twist(st[i], st[i + 1])) & 0xffffffff
+        for i in range(self.N - self.M, self.N - 1):
+            st[i] = (st[i + self.M - self.N] ^ self._twist(st[i], st[i + 1])) & 0xffffffff
+        st[self.N - 1] = (st[self.M - 1] ^ self._twist(st[self.N - 1], st[0])) & 0xffffffff
+
+    def random_uint32(self):
+        self.left -= 1
+        if self.left <= 0:
+            self._next_state()
+        y = self.st[self.next]
+        self.next += 1
+        y ^= (y >> 11)
+        y ^= (y << 7) & 0x9d2c5680
+        y &= 0xffffffff
+        y ^= (y << 15) & 0xefc60000
+        y &= 0xffffffff
+        y ^= (y >> 18)
+        return y & 0xffffffff
+
+
+def _torch_randperm(n, gen):
+    """Bit-exact ``torch.randperm(n, generator=gen)`` on CPU (forward Fisher-Yates)."""
+    data = list(range(n))
+    for i in range(n - 1):
+        z = gen.random_uint32() % (n - i)
+        data[i], data[i + z] = data[i + z], data[i]
+    return data
 
 
 def _unbundle(model):
@@ -224,8 +310,9 @@ class StandalonePPOTrainer:
     def _forward(self, params, input_ids, attention_mask, **kwargs):
         # JIT the forward so XLA frees intermediate activations after each call — the
         # rollout (generation + old-logprob/value/reference forwards) otherwise accumulates
-        # eager activations and exhausts the GPU before the update. (Text path only; the mm
-        # path with extra kwargs stays eager since the run uses text-only examples.)
+        # eager activations and exhausts the GPU before the update. The text path and the
+        # audio path (precomputed tower output from ``_media_forward_kwargs``) are jitted;
+        # anything else (images: the vision prep is host-side) stays eager.
         if not kwargs:
             if getattr(self, "_fwd_jit", None) is None:
                 self._fwd_jit = jax.jit(
@@ -234,6 +321,17 @@ class StandalonePPOTrainer:
                     )
                 )
             out = self._fwd_jit(params, input_ids, attention_mask)
+        elif set(kwargs) == {"audio_features", "audio_tok_valid"}:
+            if getattr(self, "_fwd_audio_jit", None) is None:
+                self._fwd_audio_jit = jax.jit(
+                    lambda p, ids, m, af, av: self.module.apply(
+                        {"params": p}, input_ids=ids, attention_mask=m, use_cache=False,
+                        audio_features=af, audio_tok_valid=av,
+                    )
+                )
+            out = self._fwd_audio_jit(
+                params, input_ids, attention_mask, kwargs["audio_features"], kwargs["audio_tok_valid"]
+            )
         else:
             out = self.module.apply(
                 {"params": params},
@@ -245,6 +343,76 @@ class StandalonePPOTrainer:
         logits = out["logits"] if isinstance(out, dict) else out.logits
         values = out["values"] if isinstance(out, dict) else getattr(out, "values", None)
         return logits, values
+
+    # ------------------------------------------------------------------ #
+    # Multimodal inputs (mirror of torch's media-kwarg plumbing).
+    # ------------------------------------------------------------------ #
+    def _mm_token_id(self, attribute):
+        return getattr(self.processor, attribute, getattr(self.tokenizer, attribute, None))
+
+    def _mm_inputs_present_in(self, input_ids, mm_inputs: dict) -> dict:
+        """Keep only the media inputs whose placeholder tokens appear in ``input_ids``
+        (mirror of torch ``_mm_inputs_present_in``)."""
+        kept = dict(mm_inputs)
+        ids = np.asarray(input_ids)
+        for attribute, keys in _MM_GROUPS:
+            token_id = self._mm_token_id(attribute)
+            if token_id is None or bool((ids == token_id).any()):
+                continue
+            for key in keys:
+                kept.pop(key, None)
+        return kept
+
+    def _encode_audio(self, params, input_features, feature_attention_mask):
+        """Run the thinker audio tower (``thinker/audio_tower`` of ``params``, adapters
+        included) -> ``(features (B, T, D), valid-token mask (B, T))`` for the forward's
+        ``audio_features``/``audio_tok_valid``. Jitted on its own so its compile is shared by
+        every sequence-length bucket of the LM forward; differentiable, so the PPO update
+        trains the tower's LoRA adapters like torch (whose ``all-linear`` adapts them)."""
+        from transformers_impl.modeling import Qwen2_5OmniAudioEncoder
+
+        cfg = self.module.config
+        feats = np.asarray(input_features)
+        mask = np.asarray(feature_attention_mask)
+        step = 2 * int(cfg.audio_n_window) * _AUDIO_BUCKET_CHUNKS
+        longest = int(mask.sum(axis=1).max()) if mask.size else 0
+        width = min(feats.shape[-1], max(step, -(-longest // step) * step))
+        if getattr(self, "_audio_jit", None) is None:
+            encoder = Qwen2_5OmniAudioEncoder(cfg)
+            self._audio_jit = jax.jit(lambda ap, x, m: encoder.apply({"params": ap}, x, m))
+        return self._audio_jit(
+            params["thinker"]["audio_tower"], jnp.asarray(feats[..., :width]), jnp.asarray(mask[:, :width])
+        )
+
+    def _media_forward_kwargs(self, params, mm_inputs: Optional[dict]) -> dict:
+        """The flax-forward kwargs for the media inputs torch would hand its model: audio is
+        encoded with ``params`` (so the reference pass uses the adapter-free tower, as torch's
+        ``disable_adapter`` does), images pass through to the (eager) vision path. Video and
+        ``token_type_ids`` have no use in this thinker mirror and are not forwarded."""
+        kwargs = {}
+        if not mm_inputs:
+            return kwargs
+        if mm_inputs.get("input_features") is not None and mm_inputs.get("feature_attention_mask") is not None:
+            feats, valid = self._encode_audio(
+                params, mm_inputs["input_features"], mm_inputs["feature_attention_mask"]
+            )
+            kwargs["audio_features"], kwargs["audio_tok_valid"] = feats, valid
+        if mm_inputs.get("pixel_values") is not None and mm_inputs.get("image_grid_thw") is not None:
+            kwargs["pixel_values"] = jnp.asarray(np.asarray(mm_inputs["pixel_values"]))
+            kwargs["image_grid_thw"] = np.asarray(mm_inputs["image_grid_thw"])
+        return kwargs
+
+    @staticmethod
+    def _slice_mm(mm_inputs: dict, index, n_rows: int) -> dict:
+        """Per-row slice of the media inputs whose leading dim is the batch (torch slices
+        ``value[idx]`` when ``value.size(0)`` equals the row count, else passes it whole)."""
+        out = {}
+        for key, value in mm_inputs.items():
+            if isinstance(value, (np.ndarray, jnp.ndarray)) and value.ndim > 0 and value.shape[0] == n_rows:
+                out[key] = np.asarray(value)[index]
+            else:
+                out[key] = value
+        return out
 
     def _next_key(self):
         self.rng, sub = jax.random.split(self.rng)
@@ -274,13 +442,34 @@ class StandalonePPOTrainer:
             logits = full
         return int(jax.random.categorical(self._next_key(), logits))
 
+    def _row_audio_offsets(self, prompts, feature_attention_mask) -> list:
+        """Index of each prompt row's first audio in the (row-major) audio batch, from the
+        per-audio placeholder counts (``_audio_seqlen`` of each clip's valid mel length)."""
+        lengths = np.asarray(feature_attention_mask).sum(axis=1)
+        per_audio = ((lengths - 1) // 2 + 1 - 2) // 2 + 1
+        bounds = np.concatenate([[0], np.cumsum(per_audio)])
+        token_id = self._mm_token_id("audio_token_id")
+        offsets, seen = [], 0
+        for prompt in prompts:
+            offsets.append(int(np.searchsorted(bounds, seen, side="left")))
+            seen += int((np.asarray(prompt) == token_id).sum())
+        return offsets
+
     def _generate_responses(self, batch, generation_config=None, seed_offset=None):
-        """Autoregressive sampling rollout. Returns lists of (query, response) int arrays.
+        """Autoregressive greedy rollout. Returns lists of (query, response) int arrays.
 
         The prompt is taken from where target labels begin (``labels != -100``), mirroring
         torch's supervised-style PPO batches. ``generation_config`` overrides the default
-        sampling config (a greedy config for evaluation); ``seed_offset`` fixes the sampling
-        RNG for a reproducible rollout (greedy decode is deterministic regardless).
+        config (its ``max_new_tokens`` sets the decode length); ``seed_offset`` re-seeds the
+        trainer RNG as torch re-seeds its global one. Decoding is argmax either way: torch's
+        rollout goes through the vendored thinker ``generate``, which is greedy and ignores
+        ``do_sample``/``temperature``/``top_p``/``top_k``.
+
+        Media inputs in ``batch`` (``_MM_KEYS``) are kept only when their placeholder occurs
+        in the prompts (torch ``_mm_inputs_present_in``) and condition the FIRST decode step
+        only: torch's thinker ``generate`` is cache-free and hands ``input_features`` /
+        ``pixel_values`` to the prefill forward alone, re-running later steps on the bare ids
+        (so those see the raw ``<|AUDIO|>`` embeddings). Mirrored exactly here.
         """
         gen_config = generation_config if generation_config is not None else self.generation_config
         if seed_offset is not None:
@@ -289,9 +478,9 @@ class StandalonePPOTrainer:
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
         input_ids = np.asarray(batch["input_ids"])
         attention_mask = np.asarray(batch["attention_mask"])
-        labels = np.asarray(batch["labels"]) if "labels" in batch else None
+        labels = np.asarray(batch["labels"]) if batch.get("labels") is not None else None
 
-        queries, responses = [], []
+        prompts = []
         for row in range(input_ids.shape[0]):
             nonpad = np.nonzero(attention_mask[row])[0]
             start = int(nonpad[0]) if len(nonpad) else 0
@@ -304,7 +493,32 @@ class StandalonePPOTrainer:
             prompt = input_ids[row, start:prompt_end]
             if prompt.size == 0:
                 prompt = input_ids[row, start:end]
-            queries.append(np.asarray(prompt))
+            prompts.append(np.asarray(prompt))
+
+        mm_inputs = {k: batch[k] for k in _MM_KEYS if batch.get(k) is not None}
+        mm_inputs = self._mm_inputs_present_in(np.concatenate(prompts), mm_inputs) if mm_inputs else {}
+        media = self._media_forward_kwargs(self.params, mm_inputs)
+        if "pixel_values" in media and len(prompts) > 1:
+            # The vision path takes one image set per call; this repo's rollout batches are
+            # single-row (per_device_train_batch_size=1), so multi-row image rollouts drop them.
+            logger.warning("image inputs dropped from a %d-row rollout", len(prompts))
+            media.pop("pixel_values")
+            media.pop("image_grid_thw")
+        if "audio_features" in media:
+            n_audio, t_max = int(media["audio_tok_valid"].shape[0]), int(media["audio_tok_valid"].shape[1])
+            flat_feats = media["audio_features"].reshape(1, n_audio * t_max, -1)
+            flat_valid = media["audio_tok_valid"].reshape(1, n_audio * t_max)
+            audio_offsets = self._row_audio_offsets(prompts, mm_inputs["feature_attention_mask"])
+
+        queries, responses = [], []
+        for row, prompt in enumerate(prompts):
+            queries.append(prompt)
+            prefill = {k: v for k, v in media.items() if k in ("pixel_values", "image_grid_thw")}
+            if "audio_features" in media:
+                # This row's audio tokens take the stream from its first audio onward.
+                shift = audio_offsets[row] * t_max
+                prefill["audio_features"] = flat_feats if shift == 0 else jnp.roll(flat_feats, -shift, axis=1)
+                prefill["audio_tok_valid"] = flat_valid if shift == 0 else jnp.roll(flat_valid, -shift, axis=1)
 
             # Fixed-shape decode: preallocate a (1, total) buffer and forward it whole each
             # step (the attention mask gates unfilled positions). ``total`` rounds the full
@@ -327,8 +541,11 @@ class StandalonePPOTrainer:
             gen = []
             for step in range(max_new):
                 pos = plen + step
-                logits, _ = self._forward(self.params, jnp.asarray(buf), jnp.asarray(mask))
-                tok = self._sample_token(logits[0, pos - 1], gen_config)
+                logits, _ = self._forward(
+                    self.params, jnp.asarray(buf), jnp.asarray(mask), **(prefill if step == 0 else {})
+                )
+                # Greedy, as torch's vendored thinker ``generate`` is regardless of do_sample.
+                tok = int(jnp.argmax(logits[0, pos - 1].astype(jnp.float32)))
                 gen.append(tok)
                 buf[0, pos] = tok
                 mask[0, pos] = 1
@@ -386,8 +603,12 @@ class StandalonePPOTrainer:
                 out[i, max_len - seq.shape[0] :] = seq
         return out
 
-    def _compute_logprobs_and_values(self, params, full_ids, full_mask):
-        logits, values = self._forward(params, full_ids, full_mask)
+    def _compute_logprobs_and_values(self, params, full_ids, full_mask, **mm_inputs):
+        """Policy log-probs + values over ``full_ids``; ``mm_inputs`` are the raw media
+        inputs (torch's ``**kwargs``), encoded here with ``params``."""
+        logits, values = self._forward(
+            params, full_ids, full_mask, **self._media_forward_kwargs(params, mm_inputs)
+        )
         logprobs = logprobs_from_logits(logits[:, :-1, :], full_ids[:, 1:])
         return logprobs, values
 
@@ -404,15 +625,28 @@ class StandalonePPOTrainer:
             return disable_adapters(self.params)
         return self.params
 
-    def _compute_ref_logprobs(self, full_ids, full_mask):
-        ref_params = self._reference_params()
-        logits, _ = self._forward(jax.lax.stop_gradient(ref_params), full_ids, full_mask)
+    def _compute_ref_logprobs(self, full_ids, full_mask, **mm_inputs):
+        """Reference log-probs; media inputs are encoded with the reference (adapter-free)
+        params, as torch's ``disable_adapter()`` forward does."""
+        ref_params = jax.lax.stop_gradient(self._reference_params())
+        logits, _ = self._forward(
+            ref_params, full_ids, full_mask, **self._media_forward_kwargs(ref_params, mm_inputs)
+        )
         return logprobs_from_logits(logits[:, :-1, :], full_ids[:, 1:])
 
     def _iter_batches(self, batch_size):
-        """Torch-free replacement for the shuffled, drop_last DataLoader."""
+        """Torch-free replacement for the shuffled, drop_last DataLoader, in torch's exact
+        order (see ``_TorchMT19937``); one call per epoch, like ``iter(dataloader)``. The
+        global numpy RNG is left untouched, so the PPO minibatch permutations draw from it
+        exactly as torch's do."""
         n = len(self.train_dataset)
-        order = np.random.permutation(n)
+        if getattr(self, "_order_gen", None) is None:
+            self._order_gen = _TorchMT19937(int(getattr(self.training_args, "seed", 42)))
+        gen = self._order_gen
+        gen.random_uint32()  # the DataLoader iterator's int64 base-seed draw
+        gen.random_uint32()
+        order = _torch_randperm(n, gen)
+        _torch_randperm(n, gen)  # RandomSampler's trailing randperm(n)[:0] once exhausted
         for start in range(0, n - batch_size + 1, batch_size):
             idx = order[start : start + batch_size]
             features = [self.train_dataset[int(i)] for i in idx]
@@ -422,6 +656,8 @@ class StandalonePPOTrainer:
         """Main PPO training loop (faithful to torch ``ppo_train``)."""
         args = self.training_args
         np.random.seed(int(getattr(args, "seed", 42)))
+        # torch seeds a fresh rollout-shuffle generator per ppo_train call.
+        self._order_gen = _TorchMT19937(int(getattr(args, "seed", 42)))
         ppo_args = self.ppo_args
         batch_size = args.per_device_train_batch_size
 
@@ -481,6 +717,9 @@ class StandalonePPOTrainer:
                 if global_step >= max_steps:
                     break
 
+                # Media inputs (voicebench: the clip's mel features), as torch's batch_mm_inputs.
+                batch_mm_inputs = {k: batch[k] for k in _MM_KEYS if batch.get(k) is not None}
+
                 # ------- ROLLOUT + REWARD ------- #
                 all_queries, all_responses, all_rewards = [], [], []
                 n_examples = int(np.asarray(batch["input_ids"]).shape[0])
@@ -490,6 +729,7 @@ class StandalonePPOTrainer:
                         "attention_mask": np.asarray(batch["attention_mask"])[idx : idx + batch_size],
                         "labels": np.asarray(batch["labels"])[idx : idx + batch_size] if "labels" in batch else None,
                     }
+                    mb.update(self._slice_mm(batch_mm_inputs, slice(idx, idx + batch_size), n_examples))
                     gold_responses = None
                     if self.reward_model_type == "label" and mb.get("labels") is not None:
                         gold_responses = self._gold_response_tokens(mb["labels"])
@@ -521,8 +761,12 @@ class StandalonePPOTrainer:
                 # added; the trailing pad columns are masked out of the KL/loss and never read.
                 max_seq_len = int((query_lens + response_lens).max())
 
-                old_logprobs, old_values = self._compute_logprobs_and_values(params, full_ids_j, full_mask_j)
-                ref_logprobs = self._compute_ref_logprobs(full_ids_j, full_mask_j)
+                # torch's extra_kwargs: the media inputs whose placeholders survive in query+response.
+                full_mm = self._mm_inputs_present_in(full_ids, batch_mm_inputs)
+                old_logprobs, old_values = self._compute_logprobs_and_values(
+                    params, full_ids_j, full_mask_j, **full_mm
+                )
+                ref_logprobs = self._compute_ref_logprobs(full_ids_j, full_mask_j, **full_mm)
                 kl = old_logprobs - ref_logprobs
 
                 per_token_rewards = -ppo_args.kl_coef * kl
@@ -577,10 +821,15 @@ class StandalonePPOTrainer:
                         mb_mask = full_mask_j[mb_inds]
                         mb_q = query_lens[mb_inds]
                         mb_r = response_lens[mb_inds]
+                        mb_mm = self._slice_mm(full_mm, mb_inds, bs)  # torch's mb_kwargs
 
                         def loss_fn(s_):
                             p = combine(base_params, s_, _extra) if _use_lora else s_
-                            logits, vpred = self._forward(p, mb_ids, mb_mask)
+                            # The audio tower runs inside the differentiated forward, so its
+                            # LoRA adapters get gradients as in torch.
+                            logits, vpred = self._forward(
+                                p, mb_ids, mb_mask, **self._media_forward_kwargs(p, mb_mm)
+                            )
                             new_logprobs = logprobs_from_logits(logits[:, :-1, :], mb_ids[:, 1:])
                             mb_new = jnp.zeros((len(mb_inds), max_response_len), dtype=jnp.float32)
                             mb_vpred = jnp.zeros((len(mb_inds), max_response_len), dtype=jnp.float32)
@@ -728,6 +977,11 @@ class StandalonePPOTrainer:
                     "attention_mask": np.asarray(batch["attention_mask"]),
                     "labels": labels,
                 }
+                # As in torch, only the greedy rollout sees the media inputs; the teacher-forced
+                # KL passes above are text-only.
+                for key in _MM_KEYS:
+                    if key in batch:
+                        gen_batch[key] = batch[key]
                 queries, responses = self._generate_responses(
                     gen_batch, generation_config=greedy_config, seed_offset=0
                 )

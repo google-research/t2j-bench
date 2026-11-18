@@ -143,6 +143,11 @@ def _convert_alpaca(example: dict, dataset_attr: DatasetAttr, data_args) -> dict
             {"role": "assistant", "content": chosen_value},
             {"role": "assistant", "content": rejected_value},
         ]
+    elif dataset_attr.response and isinstance(example.get(dataset_attr.response), str):
+        # torch_orig's (only) alpaca response branch: the single gold answer, which the PPO
+        # label reward scores rollouts against. Without it the answer never reaches the
+        # labels and the gold degenerates to the template's empty assistant turn.
+        response = [{"role": "assistant", "content": example[dataset_attr.response]}]
     elif dataset_attr.response and isinstance(example.get(dataset_attr.response), list):
         raw_response = example[dataset_attr.response]
         if len(raw_response) >= 2:

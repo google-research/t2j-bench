@@ -427,10 +427,16 @@ class _NestedLM(nn.Module):
         return feats.reshape(-1, feats.shape[-1])
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask=None, pixel_values=None, run_vision=None):
+    def __call__(self, input_ids, attention_mask=None, pixel_values=None, run_vision=None,
+                 image_features=None):
         cfg = self.config
-        image_features = None
-        if pixel_values is not None:
+        if image_features is not None:
+            # Precomputed tower output (``_image_features_from_params``): the PPO trainer
+            # runs the frozen SigLIP tower + projector once per rollout batch and reuses the
+            # features across that batch's forwards instead of re-running the tower in each.
+            image_features = jnp.asarray(image_features)
+            image_features = image_features.reshape(-1, image_features.shape[-1])
+        elif pixel_values is not None:
             # Run the SigLIP tower only when an image placeholder sits at an attended
             # position. The graded forward and the finite-difference probe mask every image
             # token (attention_mask=0), so features reach no compared position and the graph
@@ -465,6 +471,18 @@ class _NestedLM(nn.Module):
         return node(input_ids, attention_mask)
 
 
+def _image_features_from_params(config, params, pixel_values):
+    """SigLIP tower -> projector over ``pixel_values``, outside the LM forward:
+    ``(n_images, mm_tokens_per_image, text_hidden)``. Same modules, weights
+    (``<prefix>/vision_tower``, ``<prefix>/multi_modal_projector``) and dtype handling as
+    ``_NestedLM._image_features``; feed the result back through the forward's
+    ``image_features`` kwarg."""
+    scope = params[config.prefix[0]]
+    pv = jnp.asarray(pixel_values).astype(config.dtype)
+    vision_out = SiglipVisionTransformer(config).apply({"params": scope["vision_tower"]}, pv)
+    return Gemma3MultiModalProjector(config).apply({"params": scope["multi_modal_projector"]}, vision_out)
+
+
 @flax.struct.dataclass
 class CausalLMOutput:
     logits: Any
@@ -492,7 +510,7 @@ class Gemma3ForConditionalGeneration(nn.Module):
         # on the graded golden the image tokens sit at attention_mask=0 so vision stays inert.
         hidden, embed = _NestedLM(cfg, name=cfg.prefix[0])(
             input_ids, attention_mask, pixel_values=kwargs.get("pixel_values"),
-            run_vision=kwargs.get("run_vision"),
+            run_vision=kwargs.get("run_vision"), image_features=kwargs.get("image_features"),
         )
         if cfg.tie_word_embeddings:
             logits = embed.attend(hidden)

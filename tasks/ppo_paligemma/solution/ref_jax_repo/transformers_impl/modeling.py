@@ -447,10 +447,15 @@ class _NestedLM(nn.Module):
 
     @nn.compact
     def __call__(self, input_ids, attention_mask=None, token_type_ids=None,
-                 pixel_values=None, run_vision=None):
+                 pixel_values=None, run_vision=None, image_features=None):
         cfg = self.config
-        image_features = None
-        if pixel_values is not None:
+        if image_features is not None:
+            # Precomputed tower output (``_image_features_from_params``): the PPO trainer
+            # runs the frozen SigLIP tower + projector once per rollout batch and reuses the
+            # features across that batch's forwards instead of re-running the tower in each.
+            image_features = jnp.asarray(image_features)
+            image_features = image_features.reshape(-1, image_features.shape[-1])
+        elif pixel_values is not None:
             # UNLIKE gemma3 (image tokens at attention_mask=0 -> vision inert on the golden),
             # PaliGemma's graded forward leaves the <image> placeholders ATTENDED, so the
             # SigLIP tower runs here and its features reach the compared positions.
@@ -481,6 +486,18 @@ class _NestedLM(nn.Module):
         return node(input_ids, attention_mask, token_type_ids)
 
 
+def _image_features_from_params(config, params, pixel_values):
+    """SigLIP tower -> plain-Linear projector over ``pixel_values``, outside the LM forward:
+    ``(n_images, image_seq_length, projection_dim)``. Same modules, weights
+    (``<prefix>/vision_tower``, ``<prefix>/multi_modal_projector``) and dtype handling as
+    ``_NestedLM._image_features``; feed the result back through the forward's
+    ``image_features`` kwarg."""
+    scope = params[config.prefix[0]]
+    pv = jnp.asarray(pixel_values).astype(config.dtype)
+    vision_out = SiglipVisionTransformer(config).apply({"params": scope["vision_tower"]}, pv)
+    return PaliGemmaMultiModalProjector(config).apply({"params": scope["multi_modal_projector"]}, vision_out)
+
+
 @flax.struct.dataclass
 class CausalLMOutput:
     logits: Any
@@ -509,7 +526,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # features are scattered into the placeholder positions.
         hidden, embed = _NestedLM(cfg, name=cfg.prefix[0])(
             input_ids, attention_mask, token_type_ids,
-            pixel_values=kwargs.get("pixel_values"), run_vision=kwargs.get("run_vision"))
+            pixel_values=kwargs.get("pixel_values"), run_vision=kwargs.get("run_vision"),
+            image_features=kwargs.get("image_features"))
         if cfg.tie_word_embeddings:
             logits = embed.attend(hidden)
         else:

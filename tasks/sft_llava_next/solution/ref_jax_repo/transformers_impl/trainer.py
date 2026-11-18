@@ -62,6 +62,80 @@ import optax
 logger = logging.getLogger(__name__)
 
 
+
+
+# --- torch RandomSampler parity ------------------------------------------------
+# torch_orig's ``get_train_dataloader`` wraps the train split in
+# ``RandomSampler(generator=torch.Generator().manual_seed(seed))``.  Re-iterating that
+# DataLoader once per epoch draws a fresh ``torch.randperm(n)`` from the SAME persistent
+# generator, so the three epochs see three DISTINCT shuffles -- the frozen goldens were
+# produced under exactly that order.  A sequential JAX loop trains on a systematically
+# different trajectory (a real fidelity gap on the held-out eval loss, even though the
+# 540-step train-loss average is order-robust).  torch is not importable in the grade
+# sandbox, so this is a pure-Python bit-exact replica of CPU MT19937 + ``randperm``
+# (verified identical to ``torch.randperm`` for these split sizes).
+class _TorchMT19937:
+    N = 624; M = 397; MATRIX_A = 0x9908b0df; UMASK = 0x80000000; LMASK = 0x7fffffff
+
+    def __init__(self, seed):
+        self.st = [0] * self.N
+        self.st[0] = seed & 0xffffffff
+        for i in range(1, self.N):
+            p = self.st[i - 1]
+            self.st[i] = (1812433253 * (p ^ (p >> 30)) + i) & 0xffffffff
+        self.left = 1
+        self.next = 0
+
+    def _twist(self, u, v):
+        mix = (u & self.UMASK) | (v & self.LMASK)
+        return ((mix >> 1) ^ (self.MATRIX_A if (v & 1) else 0)) & 0xffffffff
+
+    def _next_state(self):
+        st = self.st
+        self.left = self.N
+        self.next = 0
+        for i in range(0, self.N - self.M):
+            st[i] = (st[i + self.M] ^ self._twist(st[i], st[i + 1])) & 0xffffffff
+        for i in range(self.N - self.M, self.N - 1):
+            st[i] = (st[i + self.M - self.N] ^ self._twist(st[i], st[i + 1])) & 0xffffffff
+        st[self.N - 1] = (st[self.M - 1] ^ self._twist(st[self.N - 1], st[0])) & 0xffffffff
+
+    def random_uint32(self):
+        self.left -= 1
+        if self.left <= 0:
+            self._next_state()
+        y = self.st[self.next]
+        self.next += 1
+        y ^= (y >> 11)
+        y ^= (y << 7) & 0x9d2c5680
+        y &= 0xffffffff
+        y ^= (y << 15) & 0xefc60000
+        y &= 0xffffffff
+        y ^= (y >> 18)
+        return y & 0xffffffff
+
+
+def _torch_randperm(n, gen):
+    """Bit-exact ``torch.randperm(n, generator=gen)`` on CPU (forward Fisher-Yates)."""
+    data = list(range(n))
+    for i in range(n - 1):
+        z = gen.random_uint32() % (n - i)
+        data[i], data[i + z] = data[i + z], data[i]
+    return data
+
+
+
+def _torch_epoch_order(n, gen):
+    """One epoch of torch ``RandomSampler(generator=gen)`` over ``n`` items: ``randperm(n)`` gives
+    the order, then torch draws one more ``randperm(n)`` (its ``[:num_samples % n]`` remainder
+    slice, empty here) when the sampler is exhausted at the end of the epoch. That trailing draw
+    advances the generator, so skipping it would reproduce epoch 1 but not epochs 2+ (verified
+    against torch's own DataLoader for 3 epochs)."""
+    order = _torch_randperm(n, gen)
+    _torch_randperm(n, gen)
+    return order
+
+
 def _decay_mask(params):
     """optax label tree: ``True`` for params that receive weight decay (exclude bias /
     LayerNorm scale+bias), matching torch's ``no_decay`` name filter."""
@@ -428,24 +502,71 @@ class Trainer:
             updates, o = optimizer.update(grads, o, tr)
             return optax.apply_updates(tr, updates), o, loss
 
+        # Text-only variants. torch_orig's Dataset hands out the STORED example dicts and its
+        # collator pops ``_images`` from each one, so an example contributes its image only the
+        # first time it is collated (epoch 1). From then on torch trains it with no pixel_values:
+        # the expanded <image> placeholders stay in input_ids but keep their token embeddings.
+        # These steps reproduce that; they compile once more, on first use.
+        @functools.partial(jax.jit, donate_argnums=(0, 1))
+        def jit_step_text(p, o, batch):
+            def loss_fn(trainable):
+                model_inputs = {k: v for k, v in batch.items() if k != "labels"}
+                out = module.apply({"params": trainable}, **model_inputs)
+                logits = out["logits"] if isinstance(out, dict) else out.logits
+                return _causal_lm_loss(logits, batch["labels"], ignore_index)
+
+            loss, grads = jax.value_and_grad(loss_fn)(p)
+            updates, o = optimizer.update(grads, o, p)
+            return optax.apply_updates(p, updates), o, loss
+
+        @functools.partial(jax.jit, donate_argnums=(0, 1))
+        def jit_step_lora_text(tr, o, base, batch):
+            def loss_fn(trainable):
+                full = combine(base, trainable)
+                model_inputs = {k: v for k, v in batch.items() if k != "labels"}
+                out = module.apply({"params": full}, **model_inputs)
+                logits = out["logits"] if isinstance(out, dict) else out.logits
+                return _causal_lm_loss(logits, batch["labels"], ignore_index)
+
+            loss, grads = jax.value_and_grad(loss_fn)(tr)
+            updates, o = optimizer.update(grads, o, tr)
+            return optax.apply_updates(tr, updates), o, loss
+
         self.global_step = 0
         total_loss = 0.0
         cumulative_loss = 0.0
         start_time = time.time()
 
+        # torch trains through ``RandomSampler(generator=Generator().manual_seed(seed))``: a fresh
+        # shuffle per epoch from one persistent generator. With batch size 1 every materialized
+        # batch is one example, so visiting the batches (and their precomputed vision features)
+        # in torch's per-epoch order reproduces torch's training order exactly.
+        _perm_gen = _TorchMT19937(int(getattr(self.args, "seed", 42) or 42))
+        _shuffle = int(getattr(self.args, "per_device_train_batch_size", 1) or 1) == 1
+        _images_consumed = set()  # examples whose ``_images`` torch's collator has popped
         for epoch in range(epochs):
             self.epoch = float(epoch)
-            for bi, batch in enumerate(batches):
+            _order = _torch_epoch_order(len(batches), _perm_gen) if _shuffle else range(len(batches))
+            for bi in _order:
+                batch = batches[bi]
                 # Drop the raw modality tensors -- the frozen vision block is precomputed and
                 # passed in as ``image_features`` (fixed width -> the step compiles once).
                 batch_t = {k: v for k, v in batch.items()
                            if k not in ("image_sizes", "pixel_values")}
-                if use_lora:
+                # First collation of this example keeps its image (torch's collator then pops it).
+                with_image = bi not in _images_consumed
+                _images_consumed.add(bi)
+                if use_lora and with_image:
                     trainable, opt_state, loss = jit_step_lora(
                         trainable, opt_state, base_params, batch_t, train_feats[bi])
-                else:
+                elif use_lora:
+                    trainable, opt_state, loss = jit_step_lora_text(
+                        trainable, opt_state, base_params, batch_t)
+                elif with_image:
                     trainable, opt_state, loss = jit_step(
                         trainable, opt_state, batch_t, train_feats[bi])
+                else:
+                    trainable, opt_state, loss = jit_step_text(trainable, opt_state, batch_t)
                 loss = float(loss)
 
                 total_loss += loss

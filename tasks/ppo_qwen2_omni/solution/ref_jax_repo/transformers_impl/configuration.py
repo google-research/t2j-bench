@@ -17,7 +17,8 @@
 The graded forward runs the **thinker** Qwen2 LM + ``thinker/lm_head``. Everything is
 nested under ``thinker/`` (``thinker/model/{embed_tokens,layers/{i},norm}``). The full
 checkpoint (thinker vision/audio towers + talker + token2wav) is converted by
-``load_model``, but only the thinker LM is exercised. Qwen2 conventions: q/k/v bias, no qk-norm, rope 1e6.
+``load_model``; the thinker LM always runs, the vision/audio towers when a batch carries
+images/audio. Qwen2 conventions: q/k/v bias, no qk-norm, rope 1e6.
 """
 
 from __future__ import annotations
@@ -76,6 +77,19 @@ class Qwen2_5OmniConfig:
     vision_out_hidden_size: int = 2048
     vision_fullatt_block_indexes: tuple = (7, 15, 23, 31)
     vision_rope_theta: float = 10000.0
+    # --- thinker audio tower (Qwen2_5OmniAudioEncoder) ------------------------- #
+    # Consumed when a batch carries ``input_features`` (the voicebench PPO run). Values
+    # come from ``thinker_config.audio_config``; defaults match Qwen2.5-Omni-3B.
+    num_mel_bins: int = 128
+    audio_d_model: int = 1280
+    audio_encoder_layers: int = 32
+    audio_encoder_attention_heads: int = 20
+    audio_encoder_ffn_dim: int = 5120
+    audio_output_dim: int = 2048
+    audio_n_window: int = 100
+    audio_max_source_positions: int = 1500
+    audio_scale_embedding: bool = False
+    audio_layer_norm_eps: float = 1e-5
 
 
 def config_from_pretrained(
@@ -94,6 +108,7 @@ def config_from_pretrained(
     thinker = cfg.get("thinker_config", cfg)
     text = thinker.get("text_config", cfg)
     vision = thinker.get("vision_config", {})
+    audio = thinker.get("audio_config", {})
     hidden = int(text["hidden_size"])
     heads = int(text["num_attention_heads"])
     # M-RoPE section: HF keeps it under text rope_scaling / rope_parameters.
@@ -137,6 +152,16 @@ def config_from_pretrained(
         # out_hidden_size defaults to the text hidden size (merger emits LM-width features).
         vision_out_hidden_size=int(vision.get("out_hidden_size", hidden)),
         vision_fullatt_block_indexes=fullatt,
+        # Audio tower — parsed from thinker_config.audio_config.
+        num_mel_bins=int(audio.get("num_mel_bins", 128)),
+        audio_d_model=int(audio.get("d_model", 1280)),
+        audio_encoder_layers=int(audio.get("encoder_layers", 32)),
+        audio_encoder_attention_heads=int(audio.get("encoder_attention_heads", 20)),
+        audio_encoder_ffn_dim=int(audio.get("encoder_ffn_dim", 5120)),
+        audio_output_dim=int(audio.get("output_dim", 2048)),
+        audio_n_window=int(audio.get("n_window", 100)),
+        audio_max_source_positions=int(audio.get("max_source_positions", 1500)),
+        audio_scale_embedding=bool(audio.get("scale_embedding", False)),
     )
 
 

@@ -18,12 +18,15 @@ torch_orig modeling_qwen2_5_omni.py (text-only forward, §12.4).
 The graded forward runs the thinker's Qwen2 LM + ``thinker/lm_head``. Everything is
 nested under ``thinker/`` (``thinker/model/{embed_tokens,layers/{i},norm}`` +
 ``thinker/lm_head``); ``convert_checkpoint`` converts the full checkpoint (thinker
-vision/audio towers + talker + token2wav) but only the thinker LM is exercised. Qwen2 conventions: q/k/v bias,
+vision/audio towers + talker + token2wav). The vision tower runs when a batch carries
+``pixel_values`` and the audio tower when it carries ``input_features`` (the PPO
+training run on voicebench); the talker/token2wav stacks are never exercised. Qwen2 conventions: q/k/v bias,
 no qk-norm, SwiGLU, RMSNorm (fp32), NeoX RoPE (theta 1e6). Norms/softmax dtype-following.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -528,15 +531,213 @@ class Qwen2_5OmniVisionEncoder(nn.Module):
         return x[reverse_index]  # undo window reorder over merged units
 
 
+# ---------------------------------------------------------------------------- #
+# Thinker audio tower (Qwen2_5OmniAudioEncoder) — mirror of torch_orig.
+#
+# Exercised when a batch carries ``input_features`` (the voicebench PPO run: every prompt
+# is an ``<|AUDIO|>`` span); the frozen golden batches are image-only, so the tower is
+# never traced by the numeric probes. Whisper-style encoder: dual conv feature extractor
+# + chunked (block-diagonal) self-attention + per-audio avg-pool/ln_post/proj, producing
+# one embedding per ``<|AUDIO|>`` placeholder, scattered into the text embeddings.
+#
+# LoRA: torch_orig's PEFT targets ``all-linear`` minus the vision tower / projector /
+# lm_head, so every ``nn.Linear`` of the audio tower (q/k/v/out_proj, fc1, fc2, proj) gets
+# an adapter and trains. The linears therefore go through ``_proj`` (exactly ``nn.Dense``
+# when ``cfg.lora_rank == 0``), and ``model.loader`` adds the matching adapter leaves.
+# ---------------------------------------------------------------------------- #
+
+
+def _sinusoids(length: int, channels: int, max_timescale: float = 10000.0):
+    """Whisper ``SinusoidsPositionEmbedding`` as a computed (non-parameter) table."""
+    half = channels // 2
+    incr = math.log(max_timescale) / (half - 1)
+    inv = jnp.exp(-incr * jnp.arange(half, dtype=jnp.float32))
+    scaled = jnp.arange(length, dtype=jnp.float32)[:, None] * inv[None, :]
+    return jnp.concatenate([jnp.sin(scaled), jnp.cos(scaled)], axis=1)
+
+
+class _AudioLayerNorm(nn.Module):
+    """``nn.LayerNorm`` (scale + bias) with the reduction in float32, like torch."""
+
+    dim: int
+    eps: float = 1e-5
+    param_dtype: Any = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x):
+        scale = self.param("scale", nn.initializers.ones, (self.dim,), self.param_dtype)
+        bias = self.param("bias", nn.initializers.zeros, (self.dim,), self.param_dtype)
+        cdt = jnp.promote_types(x.dtype, jnp.float32)
+        xf = x.astype(cdt)
+        mean = jnp.mean(xf, axis=-1, keepdims=True)
+        var = jnp.mean(jnp.square(xf - mean), axis=-1, keepdims=True)
+        normed = (xf - mean) * jax.lax.rsqrt(var + self.eps)
+        return (scale.astype(cdt) * normed + bias.astype(cdt)).astype(x.dtype)
+
+
+class _AudioAttention(nn.Module):
+    """Whisper multi-head self-attention (no rotary, non-causal). ``k_proj`` has no bias.
+
+    Batched over the leading chunk axis; ``key_bias`` ``(n_chunks, S)`` is the additive
+    per-chunk key mask (0 for a chunk's valid after-cnn positions, ``_NEG`` for padding).
+    Chunk attention is block-diagonal in torch (``cu_seqlens``), so attending within each
+    chunk and masking its padded keys gives the real positions exactly torch's values.
+    """
+
+    config: Qwen2_5OmniConfig
+
+    @nn.compact
+    def __call__(self, x, key_bias):
+        cfg = self.config
+        pd = cfg.dtype
+        d = cfg.audio_d_model
+        h = cfg.audio_encoder_attention_heads
+        hd = d // h
+        c, s = x.shape[0], x.shape[1]
+        lin = lambda z, n, bias: _proj(self, z, d, n, cfg, pd, bias)
+        q = lin(x, "q_proj", True).reshape(c, s, h, hd).transpose(0, 2, 1, 3)
+        k = lin(x, "k_proj", False).reshape(c, s, h, hd).transpose(0, 2, 1, 3)
+        v = lin(x, "v_proj", True).reshape(c, s, h, hd).transpose(0, 2, 1, 3)
+        cdt = jnp.promote_types(q.dtype, jnp.float32)
+        sc = jnp.einsum("chqd,chkd->chqk", q, k).astype(cdt) * (hd ** -0.5)
+        w = jax.nn.softmax(sc + key_bias.astype(cdt)[:, None, None, :], axis=-1).astype(v.dtype)
+        o = jnp.einsum("chqk,chkd->chqd", w, v).transpose(0, 2, 1, 3).reshape(c, s, d)
+        return lin(o, "out_proj", True)
+
+
+class _AudioEncoderLayer(nn.Module):
+    config: Qwen2_5OmniConfig
+
+    @nn.compact
+    def __call__(self, x, key_bias):
+        cfg = self.config
+        eps = cfg.audio_layer_norm_eps
+        r = x
+        h = _AudioLayerNorm(cfg.audio_d_model, eps, cfg.dtype, name="self_attn_layer_norm")(x)
+        h = _AudioAttention(cfg, name="self_attn")(h, key_bias)
+        h = r + h
+        r = h
+        h = _AudioLayerNorm(cfg.audio_d_model, eps, cfg.dtype, name="final_layer_norm")(h)
+        h = _proj(self, h, cfg.audio_encoder_ffn_dim, "fc1", cfg, cfg.dtype, True)
+        h = jax.nn.gelu(h, approximate=False)
+        h = _proj(self, h, cfg.audio_d_model, "fc2", cfg, cfg.dtype, True)
+        return r + h
+
+
+class _AudioEncoderLayers(nn.Module):
+    """The stack scope (name ``layers``): ``thinker/audio_tower/layers/{i}``."""
+
+    config: Qwen2_5OmniConfig
+
+    @nn.compact
+    def __call__(self, x, key_bias):
+        for i in range(self.config.audio_encoder_layers):
+            x = _AudioEncoderLayer(self.config, name=str(i))(x, key_bias)
+        return x
+
+
+class Qwen2_5OmniAudioEncoder(nn.Module):
+    """Mirror of torch ``Qwen2_5OmniAudioEncoder.forward`` (thinker audio path).
+
+    Static-shape / jit-safe: rather than compacting each audio to its valid mel frames
+    (torch's ``input_features[feature_attention_mask]`` + per-audio chunk split), the tower
+    runs every ``n_window*2``-frame chunk of the fixed-width input and masks. Frames past an
+    audio's valid length are zeroed before ``conv1`` (torch zero-pads its tail chunk), conv
+    outputs there are zeroed before ``conv2`` (torch's ``padded_mask``), and padded after-cnn
+    positions get a ``_NEG`` key bias, so every real position is torch's value; trailing
+    all-padding chunks never influence them. Returns per-audio pooled embeddings
+    ``(B, out_len_max, output_dim)`` and a ``(B, out_len_max)`` mask marking the first
+    ``_audio_seqlen(L)`` real tokens of each audio (= its ``<|AUDIO|>`` placeholder count).
+    """
+
+    config: Qwen2_5OmniConfig
+
+    @nn.compact
+    def __call__(self, input_features, feature_attention_mask):
+        cfg = self.config
+        pd = cfg.dtype
+        d = cfg.audio_d_model
+        win = int(cfg.audio_n_window) * 2
+        xin = jnp.asarray(input_features)
+        b, mel, t_ext = xin.shape
+        k = -(-t_ext // win)  # ceil -> chunks per audio (static)
+        t_pad = k * win
+        if t_pad != t_ext:
+            xin = jnp.pad(xin, ((0, 0), (0, 0), (0, t_pad - t_ext)))
+        fam = jnp.asarray(feature_attention_mask)
+        if t_pad != fam.shape[1]:
+            fam = jnp.pad(fam, ((0, 0), (0, t_pad - fam.shape[1])))
+        # (B, T_pad, mel) -> (B*K, win, mel) chunks, with per-frame validity in the same layout.
+        pf = xin.transpose(0, 2, 1).reshape(b * k, win, mel).astype(pd)
+        frame_valid = (fam > 0).reshape(b * k, win)
+        pf = pf * frame_valid[:, :, None].astype(pf.dtype)  # torch zero-pads the tail chunk
+        vlen = frame_valid.sum(axis=1)  # valid mel frames per chunk
+        h = jax.nn.gelu(
+            nn.Conv(d, (3,), (1,), [(1, 1)], use_bias=True, param_dtype=pd, name="conv1")(pf), approximate=False
+        )
+        h = h * frame_valid[:, :, None].astype(h.dtype)
+        h = jax.nn.gelu(
+            nn.Conv(d, (3,), (2,), [(1, 1)], use_bias=True, param_dtype=pd, name="conv2")(h), approximate=False
+        )  # (B*K, S_chunk, d)
+        s_chunk = h.shape[1]
+        h = h + _sinusoids(s_chunk, d).astype(h.dtype)[None]
+        # Mask after-cnn positions past this chunk's valid length ``(vlen - 1) // 2 + 1`` (0 for
+        # an all-padding chunk: softmax over all-``_NEG`` is uniform, never NaN, and those
+        # outputs are dropped by ``tok_valid``).
+        len_after = jnp.maximum((vlen - 1) // 2 + 1, 0)
+        key_valid = jnp.arange(s_chunk)[None, :] < len_after[:, None]
+        key_bias = jnp.where(key_valid, 0.0, _NEG).astype(jnp.float32)
+        h = _AudioEncoderLayers(cfg, name="layers")(h, key_bias)
+        # Per-audio avg-pool (k=2, s=2) over the chunk-concatenated after-cnn sequence, then
+        # ln_post + proj. Every chunk but an audio's last is full, so its real after-cnn
+        # positions are the dense prefix of the ``K*S_chunk`` stream and the pool reproduces
+        # torch's per-audio pool for every real token.
+        al_max = k * s_chunk
+        out_len_max = al_max // 2
+        ha = h.reshape(b, al_max, d)[:, : out_len_max * 2].reshape(b, out_len_max, 2, d)
+        pooled = ha.mean(axis=2).astype(h.dtype)
+        pooled = _AudioLayerNorm(d, cfg.audio_layer_norm_eps, cfg.dtype, name="ln_post")(pooled)
+        feats = _proj(self, pooled, cfg.audio_output_dim, "proj", cfg, pd, True)  # (B, out_len_max, out)
+        lvalid = fam.sum(axis=1)  # valid mel frames per audio
+        out_len_real = ((lvalid - 1) // 2 + 1 - 2) // 2 + 1  # == placeholder count per audio
+        tok_valid = jnp.arange(out_len_max)[None, :] < out_len_real[:, None]
+        return feats, tok_valid
+
+
+def _scatter_audio(hidden, input_ids, audio_features, audio_tok_valid, audio_token_id: int):
+    """Place the tower's per-audio embeddings at the ``<|AUDIO|>`` placeholders (torch
+    ``inputs_embeds.masked_scatter``), jit-safe via cumsum ranks: compact the valid audio
+    tokens (row-major over audios) into a dense stream, then gather that stream at the
+    placeholder positions (row-major over ``input_ids``)."""
+    b, s, dim = hidden.shape
+    ba, tmax, od = audio_features.shape
+    feats_flat = audio_features.reshape(ba * tmax, od)
+    valid_flat = audio_tok_valid.reshape(-1)
+    m_buf = ba * tmax
+    rank = jnp.cumsum(valid_flat.astype(jnp.int32)) - 1  # 0-based slot in the compacted stream
+    dest = jnp.where(valid_flat, rank, m_buf)  # invalid tokens -> scratch row (dropped below)
+    compact = jnp.zeros((m_buf + 1, od), feats_flat.dtype).at[dest].set(feats_flat)[:m_buf]
+    ids = input_ids.reshape(-1)
+    amask = ids == audio_token_id
+    tok_rank = jnp.clip(jnp.cumsum(amask.astype(jnp.int32)) - 1, 0, m_buf - 1)
+    gathered = compact[tok_rank]
+    flat = hidden.reshape(b * s, dim)
+    flat = jnp.where(amask[:, None], gathered.astype(flat.dtype), flat)
+    return flat.reshape(b, s, dim)
+
+
 class Qwen2_5OmniTextModel(nn.Module):
     config: Qwen2_5OmniConfig
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask=None, image_features=None, position_ids=None):
+    def __call__(self, input_ids, attention_mask=None, image_features=None, position_ids=None,
+                 audio_features=None, audio_tok_valid=None):
         cfg = self.config
         b, s = input_ids.shape
         embed = nn.Embed(cfg.vocab_size, cfg.hidden_size, name="embed_tokens", param_dtype=cfg.dtype)
         hidden = embed(input_ids)
+        if audio_features is not None:  # torch scatters audio before image
+            hidden = _scatter_audio(hidden, input_ids, audio_features, audio_tok_valid, cfg.audio_token_id)
         if image_features is not None:
             hidden = _scatter_image(hidden, input_ids, image_features, cfg.image_token_id)
         if position_ids is not None:
@@ -552,7 +753,8 @@ class Qwen2_5OmniTextModel(nn.Module):
 
 class _Thinker(nn.Module):
     """The thinker scope (name ``thinker``): the Qwen2 LM (``model``) + ``lm_head``, plus the
-    vision tower (``visual``) when a batch carries ``pixel_values``."""
+    audio tower (``audio_tower``) when a batch carries ``input_features`` and the vision tower
+    (``visual``) when a batch carries ``pixel_values``."""
 
     config: Qwen2_5OmniConfig
 
@@ -577,8 +779,23 @@ class _Thinker(nn.Module):
         }
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask=None, pixel_values=None, image_grid_thw=None):
+    def __call__(self, input_ids, attention_mask=None, pixel_values=None, image_grid_thw=None,
+                 input_features=None, feature_attention_mask=None, audio_features=None,
+                 audio_tok_valid=None):
         cfg = self.config
+        # Audio (torch ``get_audio_features`` + ``masked_scatter``): either run the tower on
+        # ``input_features``/``feature_attention_mask``, or take its precomputed output
+        # (``audio_features``/``audio_tok_valid``, e.g. from ``Qwen2_5OmniAudioEncoder.apply`` on
+        # the ``thinker/audio_tower`` subtree) so a caller can encode a batch's audio once and
+        # reuse it across forwards. Presence is a static ``is not None`` check: text-only and
+        # golden probes never trace the tower, so their forward is unchanged. The tower is
+        # jit-safe (fixed shapes, cumsum scatter). For audio-only sequences torch's
+        # ``get_rope_index`` gives every row ``cumsum(attention_mask) - 1`` on all three M-RoPE
+        # axes, i.e. the plain positions the text path already uses.
+        if audio_features is None and input_features is not None and feature_attention_mask is not None:
+            audio_features, audio_tok_valid = Qwen2_5OmniAudioEncoder(cfg, name="audio_tower")(
+                input_features, feature_attention_mask
+            )
         prep = None
         if pixel_values is not None:
             try:
@@ -592,7 +809,8 @@ class _Thinker(nn.Module):
                 prep["window_index"], prep["reverse_index"], prep["smu"])
             position_ids = prep["position_ids"]
         hidden, _ = Qwen2_5OmniTextModel(cfg, name="model")(
-            input_ids, attention_mask, image_features=image_features, position_ids=position_ids
+            input_ids, attention_mask, image_features=image_features, position_ids=position_ids,
+            audio_features=audio_features, audio_tok_valid=audio_tok_valid,
         )
         logits = nn.Dense(cfg.vocab_size, use_bias=False, name="lm_head", param_dtype=cfg.dtype)(hidden)
         return logits, hidden
@@ -612,16 +830,20 @@ class CausalLMOutput:
 
 
 class Qwen2_5OmniForConditionalGeneration(nn.Module):
-    """Qwen2.5-Omni thinker LM-path causal LM (mirror; text-only, §12.4)."""
+    """Qwen2.5-Omni thinker causal LM (mirror): text, image (``pixel_values``) and audio
+    (``input_features``, or precomputed ``audio_features``) inputs, §12.4."""
 
     config: Qwen2_5OmniConfig
 
     @nn.compact
     def __call__(self, input_ids, attention_mask=None, output_hidden_states=False,
-                 pixel_values=None, image_grid_thw=None, **kwargs):
+                 pixel_values=None, image_grid_thw=None, input_features=None,
+                 feature_attention_mask=None, audio_features=None, audio_tok_valid=None, **kwargs):
         cfg = self.config
         logits, hidden = _Thinker(cfg, name="thinker")(
-            input_ids, attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw
+            input_ids, attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+            input_features=input_features, feature_attention_mask=feature_attention_mask,
+            audio_features=audio_features, audio_tok_valid=audio_tok_valid,
         )
         values = None
         if cfg.with_value_head:  # PPO value head at the top level (v_head/kernel)
@@ -629,12 +851,18 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module):
         return CausalLMOutput(logits=logits, hidden_states=None, values=values)
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens: int = 8, **kwargs):
+        """Cache-free greedy decode. Like torch's thinker ``generate``, the media inputs
+        (``input_features``/``feature_attention_mask``/``pixel_values``/``image_grid_thw``)
+        condition only the first (prefill) step; later steps re-run the bare ids."""
         params = {"params": object.__getattribute__(self, "_gen_params")}
         ids = jnp.asarray(input_ids)
         if ids.ndim == 1:
             ids = ids[None, :]
-        for _ in range(int(max_new_tokens)):
-            logits = self.apply(params, input_ids=ids, attention_mask=jnp.ones(ids.shape, jnp.int32)).logits
+        media = {k: kwargs[k] for k in ("input_features", "feature_attention_mask", "pixel_values",
+                                        "image_grid_thw") if kwargs.get(k) is not None}
+        for step in range(int(max_new_tokens)):
+            extra = media if step == 0 else {}
+            logits = self.apply(params, input_ids=ids, attention_mask=jnp.ones(ids.shape, jnp.int32), **extra).logits
             ids = jnp.concatenate([ids, jnp.argmax(logits[:, -1].astype(jnp.float32), -1)[:, None]], axis=1)
         return ids
 
@@ -646,6 +874,7 @@ __all__ = [
     "Qwen2_5OmniDecoderLayer",
     "Qwen2_5OmniTextModel",
     "Qwen2_5OmniVisionEncoder",
+    "Qwen2_5OmniAudioEncoder",
     "Qwen2_5OmniForConditionalGeneration",
     "Qwen2_5OmniConfig",
     "config_from_pretrained",

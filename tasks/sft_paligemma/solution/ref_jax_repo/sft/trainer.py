@@ -65,6 +65,80 @@ jax.config.update("jax_default_matmul_precision", "highest")
 logger = logging.getLogger(__name__)
 
 
+
+
+# --- torch RandomSampler parity ------------------------------------------------
+# torch_orig's ``get_train_dataloader`` wraps the train split in
+# ``RandomSampler(generator=torch.Generator().manual_seed(seed))``.  Re-iterating that
+# DataLoader once per epoch draws a fresh ``torch.randperm(n)`` from the SAME persistent
+# generator, so the three epochs see three DISTINCT shuffles -- the frozen goldens were
+# produced under exactly that order.  A sequential JAX loop trains on a systematically
+# different trajectory (a real fidelity gap on the held-out eval loss, even though the
+# 540-step train-loss average is order-robust).  torch is not importable in the grade
+# sandbox, so this is a pure-Python bit-exact replica of CPU MT19937 + ``randperm``
+# (verified identical to ``torch.randperm`` for these split sizes).
+class _TorchMT19937:
+    N = 624; M = 397; MATRIX_A = 0x9908b0df; UMASK = 0x80000000; LMASK = 0x7fffffff
+
+    def __init__(self, seed):
+        self.st = [0] * self.N
+        self.st[0] = seed & 0xffffffff
+        for i in range(1, self.N):
+            p = self.st[i - 1]
+            self.st[i] = (1812433253 * (p ^ (p >> 30)) + i) & 0xffffffff
+        self.left = 1
+        self.next = 0
+
+    def _twist(self, u, v):
+        mix = (u & self.UMASK) | (v & self.LMASK)
+        return ((mix >> 1) ^ (self.MATRIX_A if (v & 1) else 0)) & 0xffffffff
+
+    def _next_state(self):
+        st = self.st
+        self.left = self.N
+        self.next = 0
+        for i in range(0, self.N - self.M):
+            st[i] = (st[i + self.M] ^ self._twist(st[i], st[i + 1])) & 0xffffffff
+        for i in range(self.N - self.M, self.N - 1):
+            st[i] = (st[i + self.M - self.N] ^ self._twist(st[i], st[i + 1])) & 0xffffffff
+        st[self.N - 1] = (st[self.M - 1] ^ self._twist(st[self.N - 1], st[0])) & 0xffffffff
+
+    def random_uint32(self):
+        self.left -= 1
+        if self.left <= 0:
+            self._next_state()
+        y = self.st[self.next]
+        self.next += 1
+        y ^= (y >> 11)
+        y ^= (y << 7) & 0x9d2c5680
+        y &= 0xffffffff
+        y ^= (y << 15) & 0xefc60000
+        y &= 0xffffffff
+        y ^= (y >> 18)
+        return y & 0xffffffff
+
+
+def _torch_randperm(n, gen):
+    """Bit-exact ``torch.randperm(n, generator=gen)`` on CPU (forward Fisher-Yates)."""
+    data = list(range(n))
+    for i in range(n - 1):
+        z = gen.random_uint32() % (n - i)
+        data[i], data[i + z] = data[i + z], data[i]
+    return data
+
+
+def _torch_epoch_order(n, gen):
+    """One epoch of torch ``RandomSampler(generator=gen)`` over ``n`` items: ``randperm(n)`` gives
+    the order, then torch draws one more ``randperm(n)`` (its ``[:num_samples % n]`` remainder
+    slice, empty here) when the sampler is exhausted at the end of the epoch. That trailing draw
+    advances the generator, so skipping it would reproduce epoch 1 but not epochs 2+ (verified
+    against torch's own DataLoader for 3 epochs)."""
+    order = _torch_randperm(n, gen)
+    _torch_randperm(n, gen)
+    return order
+
+
+
 def _decay_mask(params):
     """optax label tree: ``True`` for params that receive weight decay (exclude bias /
     LayerNorm scale+bias), matching torch's ``no_decay`` name filter."""
@@ -119,9 +193,20 @@ class Trainer:
         self.ignore_index = kwargs.get("ignore_index", -100)
         self.global_step = 0
         self.epoch = 0.0
+        # persistent torch-RandomSampler RNG (lazily seeded on the first epoch)
+        self._train_perm_gen = None
 
     def get_train_dataloader(self):
-        return self._iter_batches(self.train_dataset, getattr(self.args, "per_device_train_batch_size", 1))
+        # torch wraps the train split in RandomSampler(Generator().manual_seed(seed)); one
+        # persistent MT19937 (see _TorchMT19937) yields a fresh randperm per epoch. Create it
+        # once and advance it on every call, so each epoch gets torch's distinct shuffle
+        # instead of a fixed sequential order.
+        if self._train_perm_gen is None:
+            seed = int(getattr(self.args, "seed", 42) or 42)
+            self._train_perm_gen = _TorchMT19937(seed)
+        order = _torch_epoch_order(len(self.train_dataset), self._train_perm_gen)
+        return self._iter_batches(
+            self.train_dataset, getattr(self.args, "per_device_train_batch_size", 1), order=order)
 
     def get_eval_dataloader(self, dataset=None):
         dataset = dataset if dataset is not None else self.eval_dataset
@@ -129,7 +214,7 @@ class Trainer:
             return None
         return self._iter_batches(dataset, getattr(self.args, "per_device_eval_batch_size", 1))
 
-    def _iter_batches(self, dataset, batch_size):
+    def _iter_batches(self, dataset, batch_size, order=None):
         """Sequential batches of `batch_size`, collated and converted to jnp arrays.
 
         The JAX stand-in for ``DataLoader``: a fresh generator per call, so ``train()`` can
@@ -144,21 +229,33 @@ class Trainer:
         ``attention_mask=0`` and ``labels=IGNORE_INDEX``, so with right-padding and a causal
         mask the real tokens never attend to them and never enter the loss average — the
         losses are identical to pad-to-longest, only the wall-clock differs.
+
+        Every collated key is kept, as torch's Trainer hands the whole batch to the model:
+        only the TEXT tensors are padded to the fixed width, while modality tensors
+        (``pixel_values``) pass through untouched so the SigLIP tower conditions on them.
         """
         batch_size = int(batch_size or 1) or 1
         n = len(dataset)
-        keys = ("input_ids", "attention_mask", "labels")
         pad_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
-        pad_values = {"input_ids": pad_id, "attention_mask": 0, "labels": self.ignore_index}
+        pad_values = {"input_ids": pad_id, "attention_mask": 0, "labels": self.ignore_index,
+                      "token_type_ids": 0}
+        seq_keys = set(pad_values)
 
         # Collate every batch up front so the whole split shares one padded width.
         collated = []
         max_len = 1
+        # ``order`` (torch's per-epoch randperm) permutes the examples before batching;
+        # None keeps dataset order (eval uses torch's SequentialSampler).
+        index = list(range(n)) if order is None else list(order)
         for i in range(0, n, batch_size):
-            feats = [dataset[j] for j in range(i, min(i + batch_size, n))]
+            feats = [dataset[index[j]] for j in range(i, min(i + batch_size, n))]
             raw = self.data_collator(feats)
             raw = raw.data if hasattr(raw, "data") else raw
-            batch = {k: np.asarray(raw[k]) for k in keys if k in raw}
+            batch = {}
+            for k, v in raw.items():
+                arr = np.asarray(v) if v is not None else None
+                if arr is not None and arr.dtype.kind in "biuf":  # numeric model inputs only
+                    batch[k] = arr
             if "input_ids" in batch:
                 max_len = max(max_len, batch["input_ids"].shape[-1])
             collated.append(batch)
@@ -167,7 +264,7 @@ class Trainer:
             for batch in collated:
                 out = {}
                 for k, v in batch.items():
-                    pad_width = max_len - v.shape[-1]
+                    pad_width = max_len - v.shape[-1] if k in seq_keys else 0
                     if pad_width > 0:
                         widths = [(0, 0)] * (v.ndim - 1) + [(0, pad_width)]
                         v = np.pad(v, widths, mode="constant", constant_values=pad_values.get(k, 0))
@@ -264,10 +361,16 @@ class Trainer:
                 # ``token_type_ids`` is a real model input for PaliGemma, not metadata: the
                 # prefix-LM mask is causal everywhere except inside the image block, which is
                 # exactly what these ids delimit. torch's Trainer hands the whole batch to the
-                # model; dropping the ids here would train under a plain causal mask.
+                # model; dropping the ids here would train under a plain causal mask. The same
+                # holds for ``pixel_values``: the image features are scattered over the
+                # <image> placeholders, so training is image-conditioned as in torch.
+                # ``run_vision`` is a static Python bool (key presence is fixed per trace).
+                has_pixels = batch.get("pixel_values") is not None
                 out = module.apply({"params": full}, input_ids=batch["input_ids"],
                                    attention_mask=batch.get("attention_mask"),
-                                   token_type_ids=batch.get("token_type_ids"))
+                                   token_type_ids=batch.get("token_type_ids"),
+                                   pixel_values=batch.get("pixel_values"),
+                                   run_vision=has_pixels)
                 return _causal_lm_loss(out["logits"], batch["labels"], ignore_index)
 
             loss, grads = jax.value_and_grad(loss_fn)(p)
@@ -328,15 +431,22 @@ class Trainer:
         ignore_index = self.ignore_index
 
         @jax.jit
-        def eval_step(params, input_ids, attention_mask, labels):
-            out = module.apply({"params": params}, input_ids=input_ids, attention_mask=attention_mask)
+        def eval_step(params, batch):
+            # Same inputs as training (torch's Trainer passes the whole batch at eval too):
+            # token_type_ids for the prefix-LM mask and pixel_values for the SigLIP tower.
+            has_pixels = batch.get("pixel_values") is not None
+            out = module.apply({"params": params}, input_ids=batch["input_ids"],
+                               attention_mask=batch.get("attention_mask"),
+                               token_type_ids=batch.get("token_type_ids"),
+                               pixel_values=batch.get("pixel_values"),
+                               run_vision=has_pixels)
             logits = out["logits"] if isinstance(out, dict) else out.logits
-            return _causal_lm_loss(logits, labels, ignore_index)
+            return _causal_lm_loss(logits, batch["labels"], ignore_index)
 
         total_loss = 0.0
         num_steps = 0
         for batch in self.get_eval_dataloader():
-            loss = eval_step(self.params, batch["input_ids"], batch.get("attention_mask"), batch["labels"])
+            loss = eval_step(self.params, batch)
             total_loss += float(loss)
             num_steps += 1
 
